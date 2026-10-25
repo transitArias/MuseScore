@@ -30,6 +30,9 @@
 
 #include "types/version.h"
 
+// Experimental Muse Sounds range extension (built with Claude): see internal/rangeshim.
+extern "C" void* msr_wrap(const char* name, void* real);
+
 namespace muse::musesampler {
 struct MuseSamplerLibHandler
 {
@@ -513,7 +516,7 @@ public:
 private:
     void* libFunc(const char* funcName)
     {
-        return muse::getLibFunc(m_lib, funcName);
+        return msr_wrap(funcName, muse::getLibFunc(m_lib, funcName));
     }
 
     std::function<ms_Result()> initLib = nullptr;

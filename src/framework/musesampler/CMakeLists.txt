@@ -43,3 +43,7 @@ target_sources(muse_musesampler PRIVATE
     internal/musesampleractioncontroller.cpp
     internal/musesampleractioncontroller.h
 )
+
+# Experimental Muse Sounds range extension (built with Claude)
+add_subdirectory(internal/rangeshim)
+target_link_libraries(muse_musesampler PUBLIC muse_rangeshim)

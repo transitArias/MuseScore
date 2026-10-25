@@ -1,0 +1,1700 @@
+#ifdef MSR_STUB
+extern "C" void* msr_wrap(const char*, void* real) { return real; }
+#else
+// MuseRangeShim: a drop-in MuseSamplerCoreLib.dll proxy for MuseScore Studio.
+//
+// MuseScore loads the Muse Sounds engine from the path in MUSESAMPLER_PATH.
+// launch.cmd points that at this DLL, which loads the real engine and
+// forwards every call. Notes that the engine cannot play (above the sampled
+// range of the instrument/articulation) are routed to a hidden "shadow"
+// sampler instance transposed down, and that sampler's audio is pitch-shifted
+// back up with Signalsmith Stretch and mixed into the output.
+//
+// Range data comes from ranges.ini (written by msr-probe.exe). Instruments
+// without data are passed through untouched.
+
+#include <atomic>
+#include <io.h>
+#include <climits>
+#include <cmath>
+#include <cstdarg>
+#include <memory>
+#include <unordered_map>
+
+#include "common.h"
+#include "signalsmith-stretch/signalsmith-stretch.h"
+#include "probe_core.h"
+
+using namespace msr;
+
+#ifdef MSR_INTREE
+// Built into MuseScore itself: the engine is loaded by MuseScore as usual and
+// MuseSamplerLibHandler routes its function lookups through msr_wrap() below.
+#define EXPORT static
+#else
+#define EXPORT extern "C" __declspec(dllexport)
+#endif
+
+// ---------------------------------------------------------------------------
+// Locks
+
+struct CritSec {
+    CRITICAL_SECTION cs;
+    CritSec() { InitializeCriticalSectionAndSpinCount(&cs, 2000); }
+    ~CritSec() { DeleteCriticalSection(&cs); }
+    void lock() { EnterCriticalSection(&cs); }
+    void unlock() { LeaveCriticalSection(&cs); }
+};
+
+struct Guard {
+    CritSec& c;
+    explicit Guard(CritSec& c_) : c(c_) { c.lock(); }
+    ~Guard() { c.unlock(); }
+};
+
+// ---------------------------------------------------------------------------
+// Logging
+
+static CritSec g_logCs;
+static FILE* g_log = nullptr;
+static int g_logLevel = 1;
+
+static void logf(int level, const char* fmt, ...)
+{
+    if (level > g_logLevel || !g_log) return;
+    Guard g(g_logCs);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_log, "%02d:%02d:%02d.%03d [%lu] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            (unsigned long)GetCurrentThreadId());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
+
+// Open the log so other programs (launch.cmd, Notepad) can read it while MuseScore runs.
+static FILE* openSharedLog(const std::wstring& path)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return nullptr;
+    int fd = _open_osfhandle((intptr_t)h, 0);
+    if (fd < 0) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    return _fdopen(fd, "w");
+}
+
+static std::wstring g_statusPath;
+// One-word status for launch.cmd, written to its own small file and closed at once.
+static void writeStatus(const char* status)
+{
+    if (g_statusPath.empty()) return;
+    FILE* f = openFile(g_statusPath, L"w");
+    if (!f) return;
+    fprintf(f, "%s\n", status);
+    fclose(f);
+}
+
+#define LOGI(...) logf(1, __VA_ARGS__)
+#define LOGD(...) logf(2, __VA_ARGS__)
+#define LOGE(...) logf(0, __VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// Real library
+
+#define MS_FUNCS(X) \
+    X(ms_get_version_major) X(ms_get_version_minor) X(ms_get_version_revision) X(ms_get_version_build_number) \
+    X(ms_init) X(ms_init_2) X(ms_deinit) X(ms_disable_reverb) \
+    X(ms_get_instrument_list) X(ms_get_matching_instrument_list) X(ms_InstrumentList_get_next) \
+    X(ms_Instrument_get_id) X(ms_Instrument_get_name) X(ms_Instrument_get_category) X(ms_Instrument_get_pack_name) \
+    X(ms_Instrument_get_vendor_name) X(ms_Instrument_get_info_json) X(ms_Instrument_get_musicxml_sound) \
+    X(ms_Instrument_get_mpe_sound) X(ms_Instrument_get_reverb_level) X(ms_Instrument_get_preset_list) \
+    X(ms_Instrument_is_online) X(ms_PresetList_get_next) X(ms_get_text_articulations) X(ms_get_drum_mapping) \
+    X(ms_reload_all_instruments) X(ms_set_logging_callback) \
+    X(ms_MuseSampler_create) X(ms_MuseSampler_destroy) X(ms_MuseSampler_init) X(ms_MuseSampler_init_2) \
+    X(ms_MuseSampler_add_track) X(ms_MuseSampler_finalize_track) X(ms_MuseSampler_clear_track) \
+    X(ms_MuseSampler_add_track_note_event_5) X(ms_MuseSampler_add_track_note_event_6) \
+    X(ms_MuseSampler_add_track_dynamics_event_2) X(ms_MuseSampler_add_track_pedal_event_2) \
+    X(ms_MuseSampler_is_ranged_articulation) X(ms_MuseSampler_add_track_event_range_start) \
+    X(ms_MuseSampler_add_track_event_range_end) X(ms_MuseSampler_add_pitch_bend) X(ms_MuseSampler_add_vibrato) \
+    X(ms_MuseSampler_add_track_syllable_event) X(ms_MuseSampler_add_track_syllable_event_2) \
+    X(ms_MuseSampler_add_track_text_articulation_event) X(ms_MuseSampler_create_preset_change) \
+    X(ms_MuseSampler_add_preset) X(ms_MuseSampler_start_audition_note_4) X(ms_MuseSampler_start_audition_note_5) \
+    X(ms_MuseSampler_stop_audition_note) X(ms_MuseSampler_add_audition_cc_event) \
+    X(ms_MuseSampler_start_offline_mode) X(ms_MuseSampler_stop_offline_mode) X(ms_MuseSampler_process_offline) \
+    X(ms_MuseSampler_process) X(ms_MuseSampler_set_position) X(ms_MuseSampler_set_playing) \
+    X(ms_MuseSampler_all_notes_off) X(ms_MuseSampler_ready_to_play) X(ms_MuseSampler_set_score_id) \
+    X(ms_MuseSampler_set_auto_render_interval) X(ms_MuseSampler_trigger_render) \
+    X(ms_MuseSampler_clear_online_cache) X(ms_MuseSampler_set_lazy_render) \
+    X(ms_MuseSampler_set_rendering_state_changed_callback) X(ms_MuseSampler_set_rendering_state_changed_callback_2) \
+    X(ms_RenderProgressInfo_get_next) X(ms_RenderProgressInfo2_get_next)
+
+struct RealLib {
+    HMODULE h = nullptr;
+#define DECL(n) n##_t n = nullptr;
+    MS_FUNCS(DECL)
+#undef DECL
+};
+
+static RealLib R;
+
+// ---------------------------------------------------------------------------
+// Configuration
+
+struct Config {
+    bool enabled = true;
+    bool octaveMode = true;   // false = "nearest": shift the top sample by the exact interval
+    int maxShiftUp = 24;
+    bool extendDown = false;
+    int maxShiftDown = 12;
+    bool legatoPhrases = true;
+    double shifterBlockMs = 60.0;
+    bool formant = false;
+    double tonalityLimitHz = 0.0;
+    float gain = 1.0f;
+    double idleSeconds = 3.0;
+};
+
+static Config g_cfg;
+static std::wstring g_dir;
+static std::map<std::string, InstRange> g_rangesByKey; // lower-case "pack|name"
+static std::map<int, InstRange> g_rangesById;
+static std::string g_rangesLibVersion;
+static std::string g_engineVer;
+
+static CritSec g_instCs;
+static std::unordered_map<int, std::string> g_instKeyById; // from the engine's instrument list
+static bool g_instEnumerated = false;
+
+static std::atomic<long long> g_synthId { (1LL << 52) };
+
+static std::wstring moduleDir()
+{
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&moduleDir, &self);
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = GetModuleFileNameW(self, buf, MAX_PATH * 4);
+    std::wstring p(buf, n);
+    size_t s = p.find_last_of(L"\\/");
+    return s == std::wstring::npos ? L"." : p.substr(0, s);
+}
+
+static void loadConfigAndRanges()
+{
+    Ini cfg;
+    cfg.load(g_dir + L"\\config.ini");
+    g_logLevel = (int)cfg.geti("general", "log", 1);
+    g_cfg.enabled = cfg.geti("general", "enabled", 1) != 0;
+    g_cfg.octaveMode = lower(cfg.get("general", "mode", "octave")) != "nearest";
+    g_cfg.maxShiftUp = (int)std::max<long long>(1, cfg.geti("general", "max_shift_up", 24));
+    g_cfg.extendDown = cfg.geti("general", "extend_down", 0) != 0;
+    g_cfg.maxShiftDown = (int)std::max<long long>(1, cfg.geti("general", "max_shift_down", 12));
+    g_cfg.legatoPhrases = cfg.geti("general", "legato_phrases", 1) != 0;
+    g_cfg.shifterBlockMs = std::min(250.0, std::max(20.0, cfg.getd("general", "shifter_block_ms", 60.0)));
+    g_cfg.formant = cfg.geti("general", "formant_preserve", 0) != 0;
+    g_cfg.tonalityLimitHz = cfg.getd("general", "tonality_limit_hz", 0.0);
+    g_cfg.gain = (float)std::pow(10.0, cfg.getd("general", "gain_db", 0.0) / 20.0);
+
+    Ini rng;
+    if (!rng.load(g_dir + L"\\ranges.ini")) {
+        LOGE("ranges.ini not found in the shim folder: run msr-probe.exe first. Passing everything through.");
+    }
+    g_rangesLibVersion = rng.get("meta", "lib_version");
+    for (const auto& s : rng.order) {
+        if (s == "meta" || s.empty()) continue;
+        InstRange r;
+        applyRangeSection(r, rng.sec[s]);
+        g_rangesByKey[s] = r;
+    }
+    // config.ini sections named like ranges.ini sections override / extend them
+    for (const auto& s : cfg.order) {
+        if (s == "general" || s.empty()) continue;
+        InstRange& r = g_rangesByKey[s];
+        applyRangeSection(r, cfg.sec[s]);
+    }
+    for (const auto& p : g_rangesByKey) {
+        if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
+    }
+    LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
+         (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
+         (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
+         g_rangesLibVersion.empty() ? "?" : g_rangesLibVersion.c_str());
+}
+
+static void engineLogCb(ms_ErrorLevel level, const char* msg);
+
+static BOOL CALLBACK initOnceFn(PINIT_ONCE, PVOID, PVOID*)
+{
+#ifdef MSR_INTREE
+    g_dir = envPath(L"MSR_DIR");
+    if (g_dir.empty()) g_dir = envPath(L"LOCALAPPDATA") + L"\\MuseRangeShim";
+    CreateDirectoryW(g_dir.c_str(), nullptr);
+    g_log = openSharedLog(g_dir + L"\\shim.log");
+    g_statusPath = g_dir + L"\\shim_status.txt";
+    writeStatus("loaded");
+    LOGE("STATUS loaded");
+    LOGI("MuseRangeShim built into MuseScore (in-tree mode); folder %s", narrow(g_dir).c_str());
+    loadConfigAndRanges();
+    return TRUE;
+#endif
+    HMODULE pinned = nullptr; // keep this DLL loaded: the engine holds callbacks into it
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&initOnceFn, &pinned);
+    g_dir = moduleDir();
+    g_log = openSharedLog(g_dir + L"\\shim.log");
+    g_statusPath = g_dir + L"\\shim_status.txt";
+    writeStatus("loaded");
+    loadConfigAndRanges();
+
+    Ini cfg;
+    cfg.load(g_dir + L"\\config.ini");
+    std::string custom = cfg.get("general", "real_dll");
+    std::wstring path = custom.empty() ? defaultRealDllPath() : widen(custom);
+    R.h = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!R.h) {
+        writeStatus("no-engine");
+        LOGE("FATAL: could not load the real engine at %s (error %lu)", narrow(path).c_str(), GetLastError());
+        return TRUE;
+    }
+#define LOADF(n) R.n = (n##_t)(void*)GetProcAddress(R.h, #n);
+    MS_FUNCS(LOADF)
+#undef LOADF
+    if (R.ms_set_logging_callback) R.ms_set_logging_callback(engineLogCb); // capture messages during init too
+    int maj = R.ms_get_version_major ? R.ms_get_version_major() : -1;
+    int min = R.ms_get_version_minor ? R.ms_get_version_minor() : -1;
+    int rev = R.ms_get_version_revision ? R.ms_get_version_revision() : -1;
+    char ver[64];
+    snprintf(ver, sizeof(ver), "%d.%d.%d", maj, min, rev);
+    g_engineVer = ver;
+    {
+        std::string folder = ensureInstrumentFolderEnv(path);
+        LOGI("instrument folder: %s", folder.empty() ? "(not found; engine decides)" : folder.c_str());
+    }
+    LOGI("loaded real engine %s from %s", ver, narrow(path).c_str());
+    LOGE("STATUS loaded");
+    if (!g_rangesLibVersion.empty() && g_rangesLibVersion != ver) {
+        LOGI("NOTE: ranges.ini was probed with engine %s; current is %s. Consider re-running msr-probe.exe --force.",
+             g_rangesLibVersion.c_str(), ver);
+    }
+    return TRUE;
+}
+
+static ms_logging_callback g_hostLogCb = nullptr;
+static void engineLogCb(ms_ErrorLevel level, const char* msg)
+{
+    if (level >= ms_ErrorLevel_Info) LOGI("engine: %s", msg ? msg : "");
+    else LOGD("engine: %s", msg ? msg : "");
+    if (g_hostLogCb) g_hostLogCb(level, msg);
+}
+
+static INIT_ONCE g_initOnce = INIT_ONCE_STATIC_INIT;
+static inline void ensureReal()
+{
+    InitOnceExecuteOnce(&g_initOnce, initOnceFn, nullptr, nullptr);
+}
+
+template<typename T> struct Fail { static T v() { return T {}; } };
+template<> struct Fail<ms_Result> { static ms_Result v() { return ms_Result_Error; } };
+template<> struct Fail<void> { static void v() {} };
+
+// Pure pass-through export (DLL mode only; in-tree, lookups return the real function).
+#ifdef MSR_INTREE
+#define FWD(ret, name, params, args)
+#else
+#define FWD(ret, name, params, args) \
+    EXPORT ret name params \
+    { \
+        ensureReal(); \
+        if (!R.name) return Fail<ret>::v(); \
+        return R.name args; \
+    }
+#endif
+
+// ---------------------------------------------------------------------------
+// Instrument key lookup
+
+static void enumerateInstruments()
+{
+    if (!R.ms_get_instrument_list || !R.ms_InstrumentList_get_next || !R.ms_Instrument_get_id) return;
+    ms_InstrumentList list = R.ms_get_instrument_list();
+    if (!list) return;
+    int n = 0;
+    while (ms_InstrumentInfo info = R.ms_InstrumentList_get_next(list)) {
+        int id = R.ms_Instrument_get_id(info);
+        const char* name = R.ms_Instrument_get_name ? R.ms_Instrument_get_name(info) : "";
+        const char* pack = R.ms_Instrument_get_pack_name ? R.ms_Instrument_get_pack_name(info) : "";
+        g_instKeyById[id] = lower(instrumentKey(pack, name));
+        ++n;
+    }
+    LOGI("enumerated %d engine instruments", n);
+}
+
+static const InstRange* findRange(int instId)
+{
+    Guard g(g_instCs);
+    auto it = g_instKeyById.find(instId);
+    if (it == g_instKeyById.end()) {
+        if (!g_instEnumerated) {
+            g_instEnumerated = true;
+            enumerateInstruments();
+            it = g_instKeyById.find(instId);
+        }
+    }
+    const InstRange* r = nullptr;
+    std::string key = it != g_instKeyById.end() ? it->second : std::string();
+    if (!key.empty()) {
+        auto rit = g_rangesByKey.find(key);
+        if (rit != g_rangesByKey.end()) r = &rit->second;
+    }
+    if (!r) {
+        auto iit = g_rangesById.find(instId);
+        if (iit != g_rangesById.end()) r = &iit->second;
+    }
+    if (r && (r->off || r->classTop("sustain") < 0)) r = nullptr;
+    LOGI("instrument %d (%s): %s", instId, key.empty() ? "unknown" : key.c_str(),
+         r ? ("sustain top " + noteName(r->classTop("sustain")) + ", low " + noteName(r->low)).c_str()
+           : "no range data -> pass-through");
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Per-sampler state
+
+typedef signalsmith::stretch::SignalsmithStretch<float> Stretch;
+
+struct LogEntry {
+    enum Kind { Dyn, Pedal, Text, PresetCreate, PresetAdd, Syll, RangeStart, RangeEnd } kind;
+    long long t = 0;
+    double v = 0;
+    int voice = 0;
+    uint64_t art = 0;
+    long long handle = 0;
+    std::string s;
+    bool hyph = false;
+};
+
+struct NoteRec {
+    ms_NoteEvent_5 ev;
+    long long id = 0;
+    std::string textArt;
+    std::vector<ms_PitchBendInfo> bends;
+    std::vector<ms_VibratoInfo> vibs;
+};
+
+struct QItem {
+    bool isNote = true;
+    NoteRec note;
+    bool rangeStart = false;
+    int voice = 0;
+    uint64_t art = 0;
+};
+
+struct VoiceQ {
+    std::vector<QItem> items;
+    bool hasNotes = false;
+    long long lastLoc = -1;
+    long long lastEnd = -1;
+    bool lastSlur = false;
+};
+
+struct IdRoute {
+    int shift = 0;
+    long long realId = 0;
+    bool pending = true;
+    int voice = 0;
+    size_t idx = 0;
+};
+
+struct MirrorTrack {
+    ms_Track t = nullptr;
+    std::unordered_map<long long, ms_PresetChange> presetMap;
+    int notes = 0;
+};
+
+struct TrackInfo {
+    int instId = -1;
+    bool rangeResolved = false;
+    const InstRange* range = nullptr;
+    std::vector<LogEntry> log;
+    std::string textArt;
+    std::map<int, VoiceQ> voices;
+    std::unordered_map<long long, IdRoute> ids;
+    std::map<int, MirrorTrack> mirrors; // shift -> mirror track in that shadow
+};
+
+struct Shadow {
+    int shift = 0;
+    ms_MuseSampler h = nullptr;
+    std::unique_ptr<Stretch> fx;
+    int latency = 0;
+    int la = 0; // look-ahead (multiple of block)
+    int d = 0;  // extra delay so that latency + d == la
+    bool needsPrime = true;
+    bool untouchedSinceSet = false;
+    long long lastSetPos = LLONG_MIN;
+    long long expectedPos = LLONG_MIN;
+    int notes = 0;
+    int auditions = 0;
+    long long idleSamples = 0;
+    ULONGLONG createdTick = 0;
+    std::vector<float> in[2], out[2], dl[2];
+    size_t dlPos = 0;
+};
+
+struct Sampler {
+    ms_MuseSampler s = nullptr;
+    CritSec cs;
+    double sr = 0;
+    int block = 0;
+    int ch = 2;
+    bool legacyInit = false;
+    bool inited = false;
+    bool offline = false;
+    bool playing = false;
+    double offSr = 0;
+    long long pos = 0;
+    long long offPos = 0;
+    std::string scoreId;
+    std::map<int, std::unique_ptr<Shadow> > shadows;
+    std::unordered_map<ms_Track, TrackInfo> tracks;
+    std::map<std::pair<ms_Track, int>, int> audition; // (track, pitch) -> shift
+};
+
+static CritSec g_mapCs;
+static std::unordered_map<ms_MuseSampler, std::unique_ptr<Sampler> > g_samplers;
+
+static Sampler* findS(ms_MuseSampler s)
+{
+    Guard g(g_mapCs);
+    auto it = g_samplers.find(s);
+    return it == g_samplers.end() ? nullptr : it->second.get();
+}
+
+static Sampler* getOrCreateS(ms_MuseSampler s)
+{
+    Guard g(g_mapCs);
+    auto& p = g_samplers[s];
+    if (!p) {
+        p.reset(new Sampler());
+        p->s = s;
+    }
+    return p.get();
+}
+
+// --- shifter ----------------------------------------------------------------
+
+static void configureFx(Sampler& S, Shadow& sh)
+{
+    double sr = S.offline && S.offSr > 0 ? S.offSr : S.sr;
+    if (sr <= 0) sr = 48000;
+    int block = std::max(256, (int)(sr * g_cfg.shifterBlockMs / 1000.0));
+    int interval = std::max(64, block / 4);
+    sh.fx.reset(new Stretch(12345));
+    sh.fx->configure(2, block, interval);
+    double tl = g_cfg.tonalityLimitHz > 0 ? g_cfg.tonalityLimitHz / sr : 0;
+    sh.fx->setTransposeSemitones((float)sh.shift, (float)tl);
+    if (g_cfg.formant) sh.fx->setFormantFactor(1.0f, true);
+    sh.latency = sh.fx->inputLatency() + sh.fx->outputLatency();
+    sh.la = 0;
+    sh.d = 0;
+    sh.needsPrime = true;
+}
+
+static void resetFx(Shadow& sh, int n)
+{
+    sh.la = ((sh.latency + n - 1) / n) * n;
+    sh.d = sh.la - sh.latency;
+    sh.fx->reset();
+    for (int c = 0; c < 2; ++c) sh.dl[c].assign(sh.d, 0.0f);
+    sh.dlPos = 0;
+}
+
+static void ensureBuffers(Shadow& sh, int n)
+{
+    for (int c = 0; c < 2; ++c) {
+        if ((int)sh.in[c].size() < n) sh.in[c].resize(n);
+        if ((int)sh.out[c].size() < n) sh.out[c].resize(n);
+    }
+}
+
+// Render one block of the shadow sampler into sh.in.
+static void renderShadow(Shadow& sh, int n, bool offline, long long pos, bool playing = true)
+{
+    ensureBuffers(sh, n);
+    std::fill(sh.in[0].begin(), sh.in[0].begin() + n, 0.0f);
+    std::fill(sh.in[1].begin(), sh.in[1].begin() + n, 0.0f);
+    float* chans[2] = { sh.in[0].data(), sh.in[1].data() };
+    ms_OutputBuffer b;
+    b._channels = chans;
+    b._num_data_pts = n;
+    b._num_channels = 2;
+    if (offline) R.ms_MuseSampler_process_offline(sh.h, b);
+    else R.ms_MuseSampler_process(sh.h, b, pos);
+    if (offline || playing) sh.untouchedSinceSet = false;
+}
+
+// Shift sh.in -> (latency) -> extra delay -> optionally mix into dst.
+static void runFx(Shadow& sh, int n, ms_OutputBuffer* dst)
+{
+    float* ins[2] = { sh.in[0].data(), sh.in[1].data() };
+    float* outs[2] = { sh.out[0].data(), sh.out[1].data() };
+    sh.fx->process(ins, n, outs, n);
+    if (sh.d > 0) {
+        size_t p = sh.dlPos;
+        for (int i = 0; i < n; ++i) {
+            for (int c = 0; c < 2; ++c) {
+                float x = sh.out[c][i];
+                sh.out[c][i] = sh.dl[c][p];
+                sh.dl[c][p] = x;
+            }
+            if (++p == (size_t)sh.d) p = 0;
+        }
+        sh.dlPos = p;
+    }
+    if (dst && dst->_channels) {
+        int nc = std::min(dst->_num_channels, 2);
+        int nn = std::min(n, dst->_num_data_pts);
+        const float g = g_cfg.gain;
+        for (int c = 0; c < nc; ++c) {
+            float* o = dst->_channels[c];
+            const float* sbuf = sh.out[c].data();
+            for (int i = 0; i < nn; ++i) o[i] += g * sbuf[i];
+        }
+        if (dst->_num_channels == 1) { // mono host: fold right in
+            float* o = dst->_channels[0];
+            for (int i = 0; i < nn; ++i) o[i] += g * sh.out[1][i];
+        }
+    }
+}
+
+// --- shadow lifecycle ---------------------------------------------------------
+
+static Shadow* ensureShadow(Sampler& S, int shift)
+{
+    auto it = S.shadows.find(shift);
+    if (it != S.shadows.end()) return it->second.get();
+    if (!S.inited || !R.ms_MuseSampler_create) return nullptr;
+
+    std::unique_ptr<Shadow> sh(new Shadow());
+    sh->shift = shift;
+    sh->h = R.ms_MuseSampler_create();
+    if (!sh->h) {
+        LOGE("could not create shadow sampler");
+        return nullptr;
+    }
+    ms_Result r = S.legacyInit ? R.ms_MuseSampler_init(sh->h, S.sr, S.block, S.ch)
+                               : R.ms_MuseSampler_init_2(sh->h, S.sr, S.block, S.ch);
+    if (r != ms_Result_OK) {
+        LOGE("could not init shadow sampler (sr %.0f block %d)", S.sr, S.block);
+        R.ms_MuseSampler_destroy(sh->h);
+        return nullptr;
+    }
+    if (!S.scoreId.empty() && R.ms_MuseSampler_set_score_id) R.ms_MuseSampler_set_score_id(sh->h, S.scoreId.c_str());
+    long long p = S.offline ? S.offPos : S.pos;
+    R.ms_MuseSampler_set_position(sh->h, p);
+    sh->lastSetPos = p;
+    sh->untouchedSinceSet = true;
+    if (S.offline) R.ms_MuseSampler_start_offline_mode(sh->h, S.offSr);
+    if (S.playing) R.ms_MuseSampler_set_playing(sh->h, 1);
+    configureFx(S, *sh);
+    sh->createdTick = GetTickCount64();
+    LOGI("sampler %p: created shadow for %+d semitones (shifter latency %d samples)", S.s, shift, sh->latency);
+    Shadow* raw = sh.get();
+    S.shadows[shift] = std::move(sh);
+    return raw;
+}
+
+static void replayEntry(const LogEntry& e, ms_MuseSampler h, MirrorTrack& m)
+{
+    switch (e.kind) {
+    case LogEntry::Dyn:
+        R.ms_MuseSampler_add_track_dynamics_event_2(h, m.t, ms_DynamicsEvent_2 { e.t, e.v });
+        break;
+    case LogEntry::Pedal:
+        R.ms_MuseSampler_add_track_pedal_event_2(h, m.t, ms_PedalEvent_2 { e.t, e.v });
+        break;
+    case LogEntry::Text: {
+        ms_TextArticulationEvent ev;
+        ev._start_us = e.t;
+        ev._articulation = e.s.c_str();
+        R.ms_MuseSampler_add_track_text_articulation_event(h, m.t, ev);
+        break;
+    }
+    case LogEntry::PresetCreate:
+        m.presetMap[e.handle] = R.ms_MuseSampler_create_preset_change(h, m.t, e.t);
+        break;
+    case LogEntry::PresetAdd: {
+        auto it = m.presetMap.find(e.handle);
+        if (it != m.presetMap.end()) R.ms_MuseSampler_add_preset(h, m.t, it->second, e.s.c_str());
+        break;
+    }
+    case LogEntry::Syll: {
+        ms_SyllableEvent2 ev;
+        ev._text = e.s.c_str();
+        ev._position_us = e.t;
+        ev._hyphened_to_next = e.hyph;
+        R.ms_MuseSampler_add_track_syllable_event_2(h, m.t, ev);
+        break;
+    }
+    case LogEntry::RangeStart:
+        R.ms_MuseSampler_add_track_event_range_start(h, m.t, e.voice, (ms_NoteArticulation)e.art);
+        break;
+    case LogEntry::RangeEnd:
+        R.ms_MuseSampler_add_track_event_range_end(h, m.t, e.voice, (ms_NoteArticulation)e.art);
+        break;
+    }
+}
+
+static MirrorTrack* ensureMirror(Sampler& S, TrackInfo& ti, int shift)
+{
+    auto it = ti.mirrors.find(shift);
+    if (it != ti.mirrors.end()) return &it->second;
+    Shadow* sh = ensureShadow(S, shift);
+    if (!sh) return nullptr;
+    ms_Track t = R.ms_MuseSampler_add_track(sh->h, ti.instId);
+    if (!t) {
+        LOGE("could not add shadow track for instrument %d", ti.instId);
+        return nullptr;
+    }
+    MirrorTrack& m = ti.mirrors[shift];
+    m.t = t;
+    for (const auto& e : ti.log) replayEntry(e, sh->h, m);
+    LOGD("mirror track for instrument %d at %+d, replayed %d events", ti.instId, shift, (int)ti.log.size());
+    return &m;
+}
+
+static void broadcast(Sampler& S, TrackInfo& ti, const LogEntry& e)
+{
+    for (auto& mp : ti.mirrors) {
+        auto sit = S.shadows.find(mp.first);
+        if (sit != S.shadows.end()) replayEntry(e, sit->second->h, mp.second);
+    }
+    ti.log.push_back(e);
+}
+
+static TrackInfo* trackInfo(Sampler& S, ms_Track t)
+{
+    auto it = S.tracks.find(t);
+    return it == S.tracks.end() ? nullptr : &it->second;
+}
+
+static const InstRange* rangeFor(TrackInfo& ti)
+{
+    if (!ti.rangeResolved) {
+        ti.rangeResolved = true;
+        ti.range = ti.instId >= 0 ? findRange(ti.instId) : nullptr;
+    }
+    return ti.range;
+}
+
+// --- routing ------------------------------------------------------------------
+
+// Shift (in semitones, signed) needed for a single note, 0 if none / impossible.
+static int shiftFor(int pitch, int top, int low)
+{
+    if (top < 0) return 0;
+    if (pitch > top) {
+        int s = g_cfg.octaveMode ? 12 * ((pitch - top + 11) / 12) : pitch - top;
+        if (s > g_cfg.maxShiftUp) return 0;
+        if (low >= 0 && pitch - s < low) return 0;
+        return s;
+    }
+    if (g_cfg.extendDown && low >= 0 && pitch < low) {
+        int s = g_cfg.octaveMode ? -12 * ((low - pitch + 11) / 12) : pitch - low;
+        if (-s > g_cfg.maxShiftDown) return 0;
+        if (pitch - s > top) return 0;
+        return s;
+    }
+    return 0;
+}
+
+static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shift)
+{
+    long long realId = 0;
+    ms_MuseSampler dstS = S.s;
+    ms_Track dstT = T;
+    if (shift != 0) {
+        MirrorTrack* m = ensureMirror(S, ti, shift);
+        Shadow* sh = m ? S.shadows[shift].get() : nullptr;
+        if (m && sh) {
+            dstS = sh->h;
+            dstT = m->t;
+            m->notes++;
+            sh->notes++;
+            sh->idleSamples = 0;
+        } else {
+            shift = 0;
+        }
+    }
+    ms_NoteEvent_5 ev = n.ev;
+    ev._pitch -= shift;
+    if (R.ms_MuseSampler_add_track_note_event_6(dstS, dstT, ev, realId) != ms_Result_OK) {
+        LOGD("add note failed (pitch %d, shift %d)", n.ev._pitch, shift);
+    }
+    if (shift != 0) {
+        LOGD("note %s @%lldus -> shadow %+d (plays %s)", noteName(n.ev._pitch).c_str(), n.ev._location_us, shift,
+             noteName(ev._pitch).c_str());
+    }
+    IdRoute& route = ti.ids[n.id];
+    route.shift = shift;
+    route.realId = realId;
+    route.pending = false;
+    for (auto b : n.bends) {
+        b.event_id = realId;
+        R.ms_MuseSampler_add_pitch_bend(dstS, dstT, b);
+    }
+    for (auto v : n.vibs) {
+        v.event_id = realId;
+        R.ms_MuseSampler_add_vibrato(dstS, dstT, v);
+    }
+}
+
+static void emitRange(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voice, uint64_t art)
+{
+    if (start) R.ms_MuseSampler_add_track_event_range_start(S.s, T, voice, (ms_NoteArticulation)art);
+    else R.ms_MuseSampler_add_track_event_range_end(S.s, T, voice, (ms_NoteArticulation)art);
+    LogEntry e;
+    e.kind = start ? LogEntry::RangeStart : LogEntry::RangeEnd;
+    e.voice = voice;
+    e.art = art;
+    broadcast(S, ti, e);
+}
+
+static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
+{
+    if (q.items.empty()) return;
+    const InstRange* r = ti.range;
+
+    // Legato context per note: group notes into steps by location.
+    std::vector<int> shifts(q.items.size(), 0);
+    std::vector<int> tops(q.items.size(), -1);
+    int low = r ? (r->low >= 0 ? r->low : std::max(0, r->classTop("sustain") - 36)) : -1;
+    long long prevLoc = LLONG_MIN, curLoc = LLONG_MIN;
+    bool prevStepSlur = false, curStepSlur = false;
+    bool any = false;
+    for (size_t i = 0; i < q.items.size(); ++i) {
+        QItem& it = q.items[i];
+        if (!it.isNote) continue;
+        const ms_NoteEvent_5& ev = it.note.ev;
+        if (ev._location_us != curLoc) {
+            prevLoc = curLoc;
+            prevStepSlur = curStepSlur;
+            curLoc = ev._location_us;
+            curStepSlur = false;
+        }
+        bool slur = (ev._articulation & ms_NoteArticulation_Slur) != 0;
+        curStepSlur = curStepSlur || slur;
+        int ctx = slur ? Legato_Slurred : (prevLoc != LLONG_MIN && prevStepSlur ? Legato_Target : Legato_None);
+        tops[i] = r ? r->noteTop(ev._articulation, it.note.textArt, ctx) : -1;
+        shifts[i] = shiftFor(ev._pitch, tops[i], low);
+        if (shifts[i] != 0) any = true;
+    }
+
+    // Keep a legato phrase together in one shadow so its transitions survive.
+    bool slurConnected = false;
+    {
+        long long firstLoc = LLONG_MIN;
+        bool multiStep = false, slurSeen = false;
+        for (auto& it : q.items) {
+            if (!it.isNote) continue;
+            if (firstLoc == LLONG_MIN) firstLoc = it.note.ev._location_us;
+            else if (it.note.ev._location_us != firstLoc) multiStep = true;
+            if (it.note.ev._articulation & ms_NoteArticulation_Slur) slurSeen = true;
+        }
+        slurConnected = multiStep && slurSeen;
+    }
+    if (any && g_cfg.octaveMode && g_cfg.legatoPhrases && slurConnected) {
+        int cand = 0;
+        for (size_t i = 0; i < q.items.size(); ++i) {
+            if (!q.items[i].isNote) continue;
+            if (std::abs(shifts[i]) > std::abs(cand)) cand = shifts[i];
+        }
+        bool ok = true;
+        int nNotes = 0;
+        for (size_t i = 0; i < q.items.size() && ok; ++i) {
+            if (!q.items[i].isNote) continue;
+            ++nNotes;
+            int p = q.items[i].note.ev._pitch - cand;
+            if (tops[i] >= 0 && p > tops[i]) ok = false;
+            if (low >= 0 && p < low) ok = false;
+        }
+        if (ok && nNotes > 1) {
+            for (size_t i = 0; i < q.items.size(); ++i) if (q.items[i].isNote) shifts[i] = cand;
+        }
+    }
+
+    for (size_t i = 0; i < q.items.size(); ++i) {
+        QItem& it = q.items[i];
+        if (it.isNote) emitNote(S, T, ti, it.note, shifts[i]);
+        else emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
+    }
+    q.items.clear();
+    q.hasNotes = false;
+    q.lastLoc = q.lastEnd = -1;
+    q.lastSlur = false;
+}
+
+static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
+{
+    for (auto& v : ti.voices) flushVoice(S, T, ti, v.second);
+}
+
+// --- live / offline mixing ------------------------------------------------------
+
+static bool shadowWanted(Sampler& S, Shadow& sh, int n)
+{
+    if (sh.notes > 0 || sh.auditions > 0) {
+        sh.idleSamples = 0;
+        return true;
+    }
+    double sr = S.offline && S.offSr > 0 ? S.offSr : S.sr;
+    if (sh.idleSamples < (long long)(g_cfg.idleSeconds * (sr > 0 ? sr : 48000))) {
+        sh.idleSamples += n;
+        return true;
+    }
+    sh.needsPrime = true;
+    return false;
+}
+
+static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long long pos)
+{
+    int n = out._num_data_pts;
+    if (n <= 0) return;
+    ensureBuffers(sh, n);
+    bool discontinuous = S.playing && sh.expectedPos != LLONG_MIN && pos != sh.expectedPos;
+    if (sh.la == 0 || (S.playing && (sh.needsPrime || discontinuous)) || (sh.la % n) != 0) {
+        resetFx(sh, n);
+        if (S.playing) {
+            if (!sh.untouchedSinceSet || sh.lastSetPos != pos) {
+                R.ms_MuseSampler_set_position(sh.h, pos);
+                sh.lastSetPos = pos;
+            }
+            for (long long p = pos; p < pos + sh.la; p += n) {
+                renderShadow(sh, n, false, p);
+                runFx(sh, n, nullptr);
+            }
+            sh.needsPrime = false;
+        }
+    }
+    renderShadow(sh, n, false, pos + sh.la, S.playing);
+    runFx(sh, n, &out);
+    sh.expectedPos = S.playing ? pos + n : pos;
+}
+
+static void mixShadowOffline(Sampler& S, Shadow& sh, ms_OutputBuffer& out)
+{
+    int n = out._num_data_pts;
+    if (n <= 0) return;
+    ensureBuffers(sh, n);
+    if (sh.needsPrime || sh.la == 0 || (sh.la % n) != 0) {
+        resetFx(sh, n);
+        R.ms_MuseSampler_set_position(sh.h, S.offPos);
+        sh.lastSetPos = S.offPos;
+        for (int p = 0; p < sh.la; p += n) {
+            renderShadow(sh, n, true, 0);
+            runFx(sh, n, nullptr);
+        }
+        sh.needsPrime = false;
+    }
+    renderShadow(sh, n, true, 0);
+    runFx(sh, n, &out);
+}
+
+// ---------------------------------------------------------------------------
+// Exports: pass-through
+
+FWD(int, ms_get_version_major, (), ())
+FWD(int, ms_get_version_minor, (), ())
+FWD(int, ms_get_version_revision, (), ())
+FWD(int, ms_get_version_build_number, (), ())
+FWD(ms_Result, ms_disable_reverb, (), ())
+FWD(ms_InstrumentList, ms_get_instrument_list, (), ())
+FWD(ms_InstrumentList, ms_get_matching_instrument_list, (const char* a, const char* b), (a, b))
+FWD(ms_InstrumentInfo, ms_InstrumentList_get_next, (ms_InstrumentList l), (l))
+FWD(int, ms_Instrument_get_id, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_name, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_category, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_pack_name, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_vendor_name, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_info_json, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_musicxml_sound, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_Instrument_get_mpe_sound, (ms_InstrumentInfo i), (i))
+FWD(float, ms_Instrument_get_reverb_level, (ms_InstrumentInfo i), (i))
+FWD(ms_PresetList, ms_Instrument_get_preset_list, (ms_InstrumentInfo i), (i))
+FWD(bool, ms_Instrument_is_online, (ms_InstrumentInfo i), (i))
+FWD(const char*, ms_PresetList_get_next, (ms_PresetList l), (l))
+FWD(const char*, ms_get_text_articulations, (int id, const char* preset), (id, preset))
+FWD(const char*, ms_get_drum_mapping, (int id), (id))
+FWD(ms_MuseSampler, ms_MuseSampler_create, (), ())
+FWD(int, ms_MuseSampler_is_ranged_articulation, (ms_NoteArticulation a), (a))
+FWD(ms_Result, ms_MuseSampler_add_track_note_event_5, (ms_MuseSampler ms, ms_Track t, ms_NoteEvent_4 ev, long long& id), (ms, t, ev, id))
+FWD(ms_Result, ms_MuseSampler_add_track_syllable_event, (ms_MuseSampler ms, ms_Track t, ms_SyllableEvent ev), (ms, t, ev))
+FWD(ms_Result, ms_MuseSampler_start_audition_note_4, (ms_MuseSampler ms, ms_Track t, ms_AuditionStartNoteEvent_4 ev), (ms, t, ev))
+FWD(void, ms_MuseSampler_set_auto_render_interval, (ms_MuseSampler ms, double s), (ms, s))
+FWD(void, ms_MuseSampler_trigger_render, (ms_MuseSampler ms), (ms))
+FWD(void, ms_MuseSampler_clear_online_cache, (ms_MuseSampler ms), (ms))
+FWD(void, ms_MuseSampler_set_lazy_render, (ms_MuseSampler ms, bool e), (ms, e))
+FWD(void, ms_MuseSampler_set_rendering_state_changed_callback, (ms_MuseSampler ms, ms_rendering_state_changed_callback cb, void* ud), (ms, cb, ud))
+FWD(void, ms_MuseSampler_set_rendering_state_changed_callback_2, (ms_MuseSampler ms, ms_rendering_state_changed_callback cb, void* ud), (ms, cb, ud))
+FWD(ms_RenderRangeInfo, ms_RenderProgressInfo_get_next, (ms_RenderingRangeList l), (l))
+FWD(ms_RenderRangeInfo2, ms_RenderProgressInfo2_get_next, (ms_RenderingRangeList l), (l))
+
+// ---------------------------------------------------------------------------
+// Exports: library lifecycle
+
+// ---------------------------------------------------------------------------
+// Calibration mode: launch.cmd sets MSR_CALIBRATE=1 when the Muse Sounds engine
+// refuses to start in the standalone probe. Then the range probe runs here,
+// right after MuseScore has initialised the engine and before it uses it.
+
+static void progressSink(const char* text)
+{
+    FILE* f = openFile(g_dir + L"\\probe_progress.txt", L"ab");
+    if (f) {
+        fputs(text, f);
+        fclose(f);
+    }
+}
+
+static void calibrateIfRequested()
+{
+    if (envPath(L"MSR_CALIBRATE") != L"1") return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+#define COPYF(n) A.n = R.n;
+    PROBE_FUNCS(COPYF)
+#undef COPYF
+    LOGE("STATUS calibrating");
+    writeStatus("calibrating");
+    progressSink("Engine started inside MuseScore; measuring ranges...\r\n");
+    int rc = 1;
+    try {
+        ProbeOptions o;
+        o.dir = g_dir;
+        if (g_engineVer.empty() && R.ms_get_version_major) {
+            char v[64];
+            snprintf(v, sizeof(v), "%d.%d.%d", R.ms_get_version_major(), R.ms_get_version_minor(), R.ms_get_version_revision());
+            g_engineVer = v;
+        }
+        o.ver = g_engineVer;
+        o.force = envPath(L"MSR_CALIBRATE_FORCE") == L"1";
+        g_sink = progressSink;
+        rc = runProbe(o);
+    } catch (...) {
+        LOGE("exception during calibration");
+    }
+    progressSink(rc == 0 ? "CALIBRATION DONE\r\n" : "CALIBRATION FAILED\r\n");
+    g_rangesByKey.clear();
+    g_rangesById.clear();
+    loadConfigAndRanges();
+    {
+        Guard g(g_instCs);
+        g_instKeyById.clear();
+        g_instEnumerated = false;
+    }
+}
+
+// MuseScore only calls init after its own API compatibility check has passed,
+// so this marks the shim as accepted (launch.cmd watches for it).
+static ms_Result noteInit(ms_Result r)
+{
+    if (r == ms_Result_OK) calibrateIfRequested();
+    LOGE("STATUS %s", r == ms_Result_OK ? "accepted" : "init-failed");
+    writeStatus(r == ms_Result_OK ? "accepted" : "init-failed");
+    return r;
+}
+
+EXPORT ms_Result ms_init()
+{
+    ensureReal();
+    return noteInit(R.ms_init ? R.ms_init() : ms_Result_Error);
+}
+
+EXPORT ms_Result ms_init_2()
+{
+    ensureReal();
+    return noteInit(R.ms_init_2 ? R.ms_init_2() : ms_Result_Error);
+}
+
+EXPORT ms_Result ms_reload_all_instruments()
+{
+    ensureReal();
+    if (!R.ms_reload_all_instruments) return ms_Result_Error;
+    ms_Result r = R.ms_reload_all_instruments();
+    Guard g(g_instCs);
+    g_instKeyById.clear();
+    g_instEnumerated = false;
+    return r;
+}
+
+
+EXPORT void ms_set_logging_callback(ms_logging_callback cb)
+{
+    ensureReal();
+    if (!R.ms_set_logging_callback) return;
+    g_hostLogCb = cb;
+    R.ms_set_logging_callback(engineLogCb);
+}
+
+EXPORT ms_Result ms_deinit()
+{
+    ensureReal();
+    {
+        Guard g(g_mapCs);
+        for (auto& p : g_samplers) {
+            for (auto& sp : p.second->shadows) R.ms_MuseSampler_destroy(sp.second->h);
+            p.second->shadows.clear();
+        }
+        g_samplers.clear();
+    }
+    LOGI("deinit");
+    return R.ms_deinit ? R.ms_deinit() : ms_Result_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Exports: sampler lifecycle
+
+EXPORT void ms_MuseSampler_destroy(ms_MuseSampler ms)
+{
+    ensureReal();
+    std::unique_ptr<Sampler> st;
+    {
+        Guard g(g_mapCs);
+        auto it = g_samplers.find(ms);
+        if (it != g_samplers.end()) {
+            st = std::move(it->second);
+            g_samplers.erase(it);
+        }
+    }
+    if (st) {
+        Guard g(st->cs);
+        for (auto& sp : st->shadows) R.ms_MuseSampler_destroy(sp.second->h);
+        st->shadows.clear();
+    }
+    R.ms_MuseSampler_destroy(ms);
+}
+
+static ms_Result initCommon(ms_MuseSampler ms, double sr, int block, int ch, bool legacy)
+{
+    ensureReal();
+    ms_Result r = legacy ? R.ms_MuseSampler_init(ms, sr, block, ch) : R.ms_MuseSampler_init_2(ms, sr, block, ch);
+    if (r != ms_Result_OK || !g_cfg.enabled) return r;
+    Sampler* S = getOrCreateS(ms);
+    Guard g(S->cs);
+    S->sr = sr;
+    S->block = block;
+    S->ch = ch;
+    S->legacyInit = legacy;
+    S->inited = true;
+    for (auto& sp : S->shadows) {
+        Shadow& sh = *sp.second;
+        if (legacy) R.ms_MuseSampler_init(sh.h, sr, block, ch);
+        else R.ms_MuseSampler_init_2(sh.h, sr, block, ch);
+        configureFx(*S, sh);
+    }
+    LOGD("sampler %p init sr=%.0f block=%d ch=%d", ms, sr, block, ch);
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_init(ms_MuseSampler ms, double sr, int block, int ch)
+{
+    return initCommon(ms, sr, block, ch, true);
+}
+
+EXPORT ms_Result ms_MuseSampler_init_2(ms_MuseSampler ms, double sr, int block, int ch)
+{
+    return initCommon(ms, sr, block, ch, false);
+}
+
+EXPORT void ms_MuseSampler_set_score_id(ms_MuseSampler ms, const char* id)
+{
+    ensureReal();
+    if (R.ms_MuseSampler_set_score_id) R.ms_MuseSampler_set_score_id(ms, id);
+    Sampler* S = findS(ms);
+    if (!S) return;
+    Guard g(S->cs);
+    S->scoreId = id ? id : "";
+    for (auto& sp : S->shadows) R.ms_MuseSampler_set_score_id(sp.second->h, id);
+}
+
+// ---------------------------------------------------------------------------
+// Exports: tracks and score events
+
+EXPORT ms_Track ms_MuseSampler_add_track(ms_MuseSampler ms, int instrumentId)
+{
+    ensureReal();
+    ms_Track t = R.ms_MuseSampler_add_track(ms, instrumentId);
+    Sampler* S = findS(ms);
+    if (t && S) {
+        Guard g(S->cs);
+        TrackInfo& ti = S->tracks[t];
+        ti.instId = instrumentId;
+    }
+    return t;
+}
+
+EXPORT ms_Result ms_MuseSampler_clear_track(ms_MuseSampler ms, ms_Track t)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_clear_track(ms, t);
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti) return r;
+    ti->voices.clear();
+    ti->ids.clear();
+    ti->log.clear();
+    ti->textArt.clear();
+    for (auto& mp : ti->mirrors) {
+        auto sit = S->shadows.find(mp.first);
+        if (sit == S->shadows.end()) continue;
+        R.ms_MuseSampler_clear_track(sit->second->h, mp.second.t);
+        sit->second->notes -= mp.second.notes;
+        mp.second.notes = 0;
+        mp.second.presetMap.clear();
+    }
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_finalize_track(ms_MuseSampler ms, ms_Track t)
+{
+    ensureReal();
+    Sampler* S = findS(ms);
+    if (S) {
+        Guard g(S->cs);
+        TrackInfo* ti = trackInfo(*S, t);
+        if (ti) {
+            try {
+                flushTrack(*S, t, *ti);
+            } catch (...) {
+                LOGE("exception while flushing notes");
+            }
+            for (auto& mp : ti->mirrors) {
+                auto sit = S->shadows.find(mp.first);
+                if (sit != S->shadows.end()) R.ms_MuseSampler_finalize_track(sit->second->h, mp.second.t);
+            }
+            for (auto& sp : S->shadows) sp.second->createdTick = GetTickCount64();
+            int shadowed = 0;
+            for (auto& mp : ti->mirrors) shadowed += mp.second.notes;
+            if (shadowed) LOGI("track %p (instrument %d): %d note(s) routed to shadow samplers", t, ti->instId, shadowed);
+        }
+    }
+    return R.ms_MuseSampler_finalize_track(ms, t);
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_note_event_6(ms_MuseSampler ms, ms_Track t, ms_NoteEvent_5 ev, long long& eventId)
+{
+    ensureReal();
+    Sampler* S = g_cfg.enabled ? findS(ms) : nullptr;
+    if (!S) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti || !rangeFor(*ti)) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
+    try {
+        VoiceQ& q = ti->voices[ev._voice];
+        const bool slur = (ev._articulation & ms_NoteArticulation_Slur) != 0;
+        const long long loc = ev._location_us;
+        const long long end = loc + ev._duration_us;
+        if (q.hasNotes) {
+            bool sameStep = loc == q.lastLoc;
+            bool legatoCont = g_cfg.legatoPhrases && q.lastSlur && loc > q.lastLoc && std::llabs(loc - q.lastEnd) <= 60000;
+            if (!sameStep && !legatoCont) flushVoice(*S, t, *ti, q);
+        }
+        QItem item;
+        item.isNote = true;
+        item.note.ev = ev;
+        item.note.id = g_synthId.fetch_add(1);
+        item.note.textArt = ti->textArt;
+        if (q.hasNotes && loc == q.lastLoc) {
+            q.lastSlur = q.lastSlur || slur;
+            q.lastEnd = std::max(q.lastEnd, end);
+        } else {
+            q.lastLoc = loc;
+            q.lastEnd = end;
+            q.lastSlur = slur;
+        }
+        q.hasNotes = true;
+        IdRoute route;
+        route.pending = true;
+        route.voice = ev._voice;
+        route.idx = q.items.size();
+        ti->ids[item.note.id] = route;
+        eventId = item.note.id;
+        q.items.push_back(std::move(item));
+        return ms_Result_OK;
+    } catch (...) {
+        LOGE("exception in add_note; passing through");
+        return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
+    }
+}
+
+// Route an event_id-bound call (pitch bend / vibrato).
+template<typename Info, typename Fn, typename Attach>
+static ms_Result routeById(ms_MuseSampler ms, ms_Track t, Info info, Fn realFn, Attach attach)
+{
+    Sampler* S = findS(ms);
+    if (!S) return realFn(ms, t, info);
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti) return realFn(ms, t, info);
+    auto it = ti->ids.find(info.event_id);
+    if (it == ti->ids.end()) return realFn(ms, t, info);
+    IdRoute& r = it->second;
+    if (r.pending) {
+        auto vit = ti->voices.find(r.voice);
+        if (vit != ti->voices.end() && r.idx < vit->second.items.size()) {
+            attach(vit->second.items[r.idx].note, info);
+            return ms_Result_OK;
+        }
+        return ms_Result_Error;
+    }
+    info.event_id = r.realId;
+    if (r.shift == 0) return realFn(ms, t, info);
+    auto sit = S->shadows.find(r.shift);
+    auto mit = ti->mirrors.find(r.shift);
+    if (sit == S->shadows.end() || mit == ti->mirrors.end()) return ms_Result_Error;
+    return realFn(sit->second->h, mit->second.t, info);
+}
+
+EXPORT ms_Result ms_MuseSampler_add_pitch_bend(ms_MuseSampler ms, ms_Track t, ms_PitchBendInfo info)
+{
+    ensureReal();
+    return routeById(ms, t, info, R.ms_MuseSampler_add_pitch_bend,
+                     [](NoteRec& n, const ms_PitchBendInfo& i) { n.bends.push_back(i); });
+}
+
+EXPORT ms_Result ms_MuseSampler_add_vibrato(ms_MuseSampler ms, ms_Track t, ms_VibratoInfo info)
+{
+    ensureReal();
+    return routeById(ms, t, info, R.ms_MuseSampler_add_vibrato,
+                     [](NoteRec& n, const ms_VibratoInfo& i) { n.vibs.push_back(i); });
+}
+
+static ms_Result rangeEvent(ms_MuseSampler ms, ms_Track t, int voice, ms_NoteArticulation art, bool start)
+{
+    ensureReal();
+    auto direct = [&]() {
+        return start ? R.ms_MuseSampler_add_track_event_range_start(ms, t, voice, art)
+                     : R.ms_MuseSampler_add_track_event_range_end(ms, t, voice, art);
+    };
+    Sampler* S = findS(ms);
+    if (!S) return direct();
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti) return direct();
+    try {
+        auto vit = ti->voices.find(voice);
+        if (vit != ti->voices.end() && vit->second.hasNotes) {
+            QItem item;
+            item.isNote = false;
+            item.rangeStart = start;
+            item.voice = voice;
+            item.art = (uint64_t)art;
+            vit->second.items.push_back(std::move(item));
+            return ms_Result_OK;
+        }
+        ms_Result r = direct();
+        LogEntry e;
+        e.kind = start ? LogEntry::RangeStart : LogEntry::RangeEnd;
+        e.voice = voice;
+        e.art = (uint64_t)art;
+        broadcast(*S, *ti, e);
+        return r;
+    } catch (...) {
+        LOGE("exception in range event");
+        return ms_Result_Error;
+    }
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_event_range_start(ms_MuseSampler ms, ms_Track t, int voice, ms_NoteArticulation art)
+{
+    return rangeEvent(ms, t, voice, art, true);
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_event_range_end(ms_MuseSampler ms, ms_Track t, int voice, ms_NoteArticulation art)
+{
+    return rangeEvent(ms, t, voice, art, false);
+}
+
+// Generic: forward to the main sampler, then mirror + log.
+template<typename Fn>
+static void mirrorEvent(ms_MuseSampler ms, ms_Track t, Fn makeEntry)
+{
+    Sampler* S = findS(ms);
+    if (!S) return;
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti) return;
+    try {
+        LogEntry e = makeEntry(*ti);
+        broadcast(*S, *ti, e);
+    } catch (...) {
+        LOGE("exception while mirroring an event");
+    }
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_dynamics_event_2(ms_MuseSampler ms, ms_Track t, ms_DynamicsEvent_2 ev)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_track_dynamics_event_2(ms, t, ev);
+    mirrorEvent(ms, t, [&](TrackInfo&) {
+        LogEntry e;
+        e.kind = LogEntry::Dyn;
+        e.t = ev._location_us;
+        e.v = ev._value;
+        return e;
+    });
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_pedal_event_2(ms_MuseSampler ms, ms_Track t, ms_PedalEvent_2 ev)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_track_pedal_event_2(ms, t, ev);
+    mirrorEvent(ms, t, [&](TrackInfo&) {
+        LogEntry e;
+        e.kind = LogEntry::Pedal;
+        e.t = ev._location_us;
+        e.v = ev._value;
+        return e;
+    });
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_text_articulation_event(ms_MuseSampler ms, ms_Track t, ms_TextArticulationEvent ev)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_track_text_articulation_event(ms, t, ev);
+    mirrorEvent(ms, t, [&](TrackInfo& ti) {
+        LogEntry e;
+        e.kind = LogEntry::Text;
+        e.t = ev._start_us;
+        e.s = ev._articulation ? ev._articulation : "";
+        ti.textArt = e.s;
+        return e;
+    });
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_add_track_syllable_event_2(ms_MuseSampler ms, ms_Track t, ms_SyllableEvent2 ev)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_track_syllable_event_2(ms, t, ev);
+    mirrorEvent(ms, t, [&](TrackInfo&) {
+        LogEntry e;
+        e.kind = LogEntry::Syll;
+        e.t = ev._position_us;
+        e.s = ev._text ? ev._text : "";
+        e.hyph = ev._hyphened_to_next;
+        return e;
+    });
+    return r;
+}
+
+EXPORT ms_PresetChange ms_MuseSampler_create_preset_change(ms_MuseSampler ms, ms_Track t, long long loc)
+{
+    ensureReal();
+    ms_PresetChange h = R.ms_MuseSampler_create_preset_change(ms, t, loc);
+    mirrorEvent(ms, t, [&](TrackInfo&) {
+        LogEntry e;
+        e.kind = LogEntry::PresetCreate;
+        e.t = loc;
+        e.handle = h;
+        return e;
+    });
+    return h;
+}
+
+EXPORT ms_Result ms_MuseSampler_add_preset(ms_MuseSampler ms, ms_Track t, ms_PresetChange pc, const char* name)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_preset(ms, t, pc, name);
+    mirrorEvent(ms, t, [&](TrackInfo&) {
+        LogEntry e;
+        e.kind = LogEntry::PresetAdd;
+        e.handle = pc;
+        e.s = name ? name : "";
+        return e;
+    });
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Exports: audition (clicking notes, MIDI input)
+
+EXPORT ms_Result ms_MuseSampler_start_audition_note_5(ms_MuseSampler ms, ms_Track t, ms_AuditionStartNoteEvent_5 ev)
+{
+    ensureReal();
+    Sampler* S = g_cfg.enabled ? findS(ms) : nullptr;
+    if (!S) return R.ms_MuseSampler_start_audition_note_5(ms, t, ev);
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    const InstRange* r = ti ? rangeFor(*ti) : nullptr;
+    if (r) {
+        std::string text = ev._active_text_articulation ? ev._active_text_articulation : "";
+        int top = r->noteTop(ev._articulation, text, Legato_None);
+        int lowA = r->low >= 0 ? r->low : std::max(0, r->classTop("sustain") - 36);
+        int shift = shiftFor(ev._pitch, top, lowA);
+        auto key0 = std::make_pair(t, ev._pitch);
+        auto old = S->audition.find(key0);
+        if (old != S->audition.end() && old->second != shift) { // re-trigger with different routing
+            auto sit = S->shadows.find(old->second);
+            auto mit = ti->mirrors.find(old->second);
+            if (sit != S->shadows.end() && mit != ti->mirrors.end()) {
+                R.ms_MuseSampler_stop_audition_note(sit->second->h, mit->second.t, ms_AuditionStopNoteEvent { ev._pitch - old->second });
+                if (sit->second->auditions > 0) sit->second->auditions--;
+            }
+            S->audition.erase(old);
+        }
+        if (shift != 0) {
+            MirrorTrack* m = ensureMirror(*S, *ti, shift);
+            if (m) {
+                Shadow* sh = S->shadows[shift].get();
+                ms_AuditionStartNoteEvent_5 ev2 = ev;
+                ev2._pitch -= shift;
+                auto key = std::make_pair(t, ev._pitch);
+                if (!S->audition.count(key)) sh->auditions++;
+                S->audition[key] = shift;
+                sh->idleSamples = 0;
+                LOGD("audition %s -> shadow %+d", noteName(ev._pitch).c_str(), shift);
+                return R.ms_MuseSampler_start_audition_note_5(sh->h, m->t, ev2);
+            }
+        }
+    }
+    return R.ms_MuseSampler_start_audition_note_5(ms, t, ev);
+}
+
+EXPORT ms_Result ms_MuseSampler_stop_audition_note(ms_MuseSampler ms, ms_Track t, ms_AuditionStopNoteEvent ev)
+{
+    ensureReal();
+    Sampler* S = findS(ms);
+    if (S) {
+        Guard g(S->cs);
+        auto it = S->audition.find(std::make_pair(t, ev._pitch));
+        if (it != S->audition.end()) {
+            int shift = it->second;
+            S->audition.erase(it);
+            TrackInfo* ti = trackInfo(*S, t);
+            auto sit = S->shadows.find(shift);
+            if (ti && sit != S->shadows.end()) {
+                auto mit = ti->mirrors.find(shift);
+                if (sit->second->auditions > 0) sit->second->auditions--;
+                if (mit != ti->mirrors.end()) {
+                    ms_AuditionStopNoteEvent ev2 { ev._pitch - shift };
+                    return R.ms_MuseSampler_stop_audition_note(sit->second->h, mit->second.t, ev2);
+                }
+            }
+        }
+    }
+    return R.ms_MuseSampler_stop_audition_note(ms, t, ev);
+}
+
+EXPORT ms_Result ms_MuseSampler_add_audition_cc_event(ms_MuseSampler ms, ms_Track t, int cc, float value)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_add_audition_cc_event(ms, t, cc, value);
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    TrackInfo* ti = trackInfo(*S, t);
+    if (!ti) return r;
+    for (auto& mp : ti->mirrors) {
+        auto sit = S->shadows.find(mp.first);
+        if (sit != S->shadows.end()) R.ms_MuseSampler_add_audition_cc_event(sit->second->h, mp.second.t, cc, value);
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Exports: transport and rendering
+
+EXPORT ms_Result ms_MuseSampler_all_notes_off(ms_MuseSampler ms)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_all_notes_off(ms);
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    for (auto& sp : S->shadows) {
+        R.ms_MuseSampler_all_notes_off(sp.second->h);
+        sp.second->auditions = 0;
+    }
+    S->audition.clear();
+    return r;
+}
+
+EXPORT void ms_MuseSampler_set_position(ms_MuseSampler ms, long long samples)
+{
+    ensureReal();
+    R.ms_MuseSampler_set_position(ms, samples);
+    Sampler* S = findS(ms);
+    if (!S) return;
+    Guard g(S->cs);
+    S->pos = samples;
+    S->offPos = samples;
+    for (auto& sp : S->shadows) {
+        Shadow& sh = *sp.second;
+        if (sh.notes > 0 || sh.auditions > 0) {
+            R.ms_MuseSampler_set_position(sh.h, samples);
+            sh.lastSetPos = samples;
+            sh.untouchedSinceSet = true;
+        }
+        sh.needsPrime = true;
+    }
+}
+
+EXPORT void ms_MuseSampler_set_playing(ms_MuseSampler ms, int playing)
+{
+    ensureReal();
+    R.ms_MuseSampler_set_playing(ms, playing);
+    Sampler* S = findS(ms);
+    if (!S) return;
+    Guard g(S->cs);
+    S->playing = playing != 0;
+    for (auto& sp : S->shadows) {
+        R.ms_MuseSampler_set_playing(sp.second->h, playing);
+        if (playing) sp.second->needsPrime = true;
+    }
+}
+
+EXPORT ms_Result ms_MuseSampler_start_offline_mode(ms_MuseSampler ms, double sr)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_start_offline_mode(ms, sr);
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    S->offline = true;
+    S->offSr = sr;
+    S->offPos = S->pos;
+    for (auto& sp : S->shadows) {
+        R.ms_MuseSampler_start_offline_mode(sp.second->h, sr);
+        configureFx(*S, *sp.second);
+    }
+    LOGI("sampler %p: offline mode at %.0f Hz (%d shadow(s))", ms, sr, (int)S->shadows.size());
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_stop_offline_mode(ms_MuseSampler ms)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_stop_offline_mode(ms);
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    S->offline = false;
+    for (auto& sp : S->shadows) {
+        R.ms_MuseSampler_stop_offline_mode(sp.second->h);
+        configureFx(*S, *sp.second);
+    }
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuffer buf)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_process_offline(ms, buf);
+    if (r != ms_Result_OK) return r;
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    try {
+        for (auto& sp : S->shadows) {
+            if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowOffline(*S, *sp.second, buf);
+        }
+    } catch (...) {
+        LOGE("exception in offline shadow render");
+    }
+    S->offPos += buf._num_data_pts;
+    return r;
+}
+
+EXPORT ms_Result ms_MuseSampler_process(ms_MuseSampler ms, ms_OutputBuffer buf, long long samples)
+{
+    ensureReal();
+    ms_Result r = R.ms_MuseSampler_process(ms, buf, samples);
+    if (r != ms_Result_OK) return r;
+    Sampler* S = findS(ms);
+    if (!S) return r;
+    Guard g(S->cs);
+    S->pos = samples;
+    try {
+        for (auto& sp : S->shadows) {
+            if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowLive(*S, *sp.second, buf, samples);
+        }
+    } catch (...) {
+        LOGE("exception in shadow render");
+    }
+    return r;
+}
+
+EXPORT bool ms_MuseSampler_ready_to_play(ms_MuseSampler ms)
+{
+    ensureReal();
+    bool ready = R.ms_MuseSampler_ready_to_play(ms);
+    if (!ready) return false;
+    Sampler* S = findS(ms);
+    if (!S) return true;
+    Guard g(S->cs);
+    for (auto& sp : S->shadows) {
+        Shadow& sh = *sp.second;
+        if (sh.notes > 0 && !R.ms_MuseSampler_ready_to_play(sh.h)) {
+            if (GetTickCount64() - sh.createdTick < 15000) return false;
+            LOGE("shadow %+d never reported ready; not waiting for it", sh.shift);
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+
+#ifndef MSR_INTREE
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
+{
+    // The real engine is intentionally not freed here (no FreeLibrary under the loader lock).
+    (void)reason;
+    (void)reserved;
+    return TRUE;
+}
+#endif
+
+#ifdef MSR_INTREE
+// Called by MuseSamplerLibHandler::libFunc for every engine function it looks up.
+// Records the real function and returns the range-extending wrapper where there is one.
+#define MSR_INTERCEPTED(X) \
+    X(ms_init) X(ms_init_2) X(ms_deinit) X(ms_reload_all_instruments) X(ms_set_logging_callback) \
+    X(ms_MuseSampler_destroy) X(ms_MuseSampler_init) X(ms_MuseSampler_init_2) X(ms_MuseSampler_set_score_id) \
+    X(ms_MuseSampler_add_track) X(ms_MuseSampler_clear_track) X(ms_MuseSampler_finalize_track) \
+    X(ms_MuseSampler_add_track_note_event_6) X(ms_MuseSampler_add_pitch_bend) X(ms_MuseSampler_add_vibrato) \
+    X(ms_MuseSampler_add_track_event_range_start) X(ms_MuseSampler_add_track_event_range_end) \
+    X(ms_MuseSampler_add_track_dynamics_event_2) X(ms_MuseSampler_add_track_pedal_event_2) \
+    X(ms_MuseSampler_add_track_text_articulation_event) X(ms_MuseSampler_add_track_syllable_event_2) \
+    X(ms_MuseSampler_create_preset_change) X(ms_MuseSampler_add_preset) \
+    X(ms_MuseSampler_start_audition_note_5) X(ms_MuseSampler_stop_audition_note) X(ms_MuseSampler_add_audition_cc_event) \
+    X(ms_MuseSampler_all_notes_off) X(ms_MuseSampler_set_position) X(ms_MuseSampler_set_playing) \
+    X(ms_MuseSampler_start_offline_mode) X(ms_MuseSampler_stop_offline_mode) X(ms_MuseSampler_process_offline) \
+    X(ms_MuseSampler_process) X(ms_MuseSampler_ready_to_play)
+
+extern "C" void* msr_wrap(const char* name, void* real)
+{
+    if (!name || !real) return real;
+#define MSR_SETR(n) if (std::strcmp(name, #n) == 0) R.n = (n##_t)real;
+    MS_FUNCS(MSR_SETR)
+#undef MSR_SETR
+    ensureReal();
+    if (!g_cfg.enabled) return real;
+#define MSR_WRAP(n) if (std::strcmp(name, #n) == 0) return (void*)&n;
+    MSR_INTERCEPTED(MSR_WRAP)
+#undef MSR_WRAP
+    return real;
+}
+#endif
+
+#endif // MSR_STUB
