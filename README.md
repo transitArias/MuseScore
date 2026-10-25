@@ -1,3 +1,10 @@
+> [!WARNING]
+> **Experimental, unofficial fork, built with Claude (Anthropic's AI assistant).**
+> This branch (`muse-range-test`) is MuseScore Studio 4.7.5 used to experiment with
+> extending Muse Sounds instruments past their sampled range (pitch-shifting notes the
+> engine would otherwise leave silent). It is not affiliated with or endorsed by
+> MuseScore / Muse Group. For the real thing, use https://github.com/musescore/MuseScore.
+
 # ![MuseScore Studio](share/icons/musescore_logo_full.png)
 
 Music notation and composition software
