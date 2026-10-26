@@ -158,6 +158,9 @@ struct Config {
     double tonalityLimitHz = 0.0;
     float gain = 1.0f;
     double idleSeconds = 3.0;
+    double staccatoScale = 1.0; // multiply written length of staccato(issimo) notes
+    int legatoMaxLeap = 0;      // >0: no legato transition for leaps larger than this (semitones)
+    bool legatoMaxLeapSoloOnly = true;
 };
 
 static Config g_cfg;
@@ -200,6 +203,9 @@ static void loadConfigAndRanges()
     g_cfg.formant = cfg.geti("general", "formant_preserve", 0) != 0;
     g_cfg.tonalityLimitHz = cfg.getd("general", "tonality_limit_hz", 0.0);
     g_cfg.gain = (float)std::pow(10.0, cfg.getd("general", "gain_db", 0.0) / 20.0);
+    g_cfg.staccatoScale = std::min(1.0, std::max(0.05, cfg.getd("general", "staccato_scale", 1.0)));
+    g_cfg.legatoMaxLeap = (int)std::max<long long>(0, cfg.geti("general", "legato_max_leap", 0));
+    g_cfg.legatoMaxLeapSoloOnly = cfg.geti("general", "legato_max_leap_solo_only", 1) != 0;
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -221,6 +227,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d)", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -334,7 +341,7 @@ static void enumerateInstruments()
     LOGI("enumerated %d engine instruments", n);
 }
 
-static const InstRange* findRange(int instId)
+static const InstRange* findRange(int instId, bool* isSolo = nullptr)
 {
     Guard g(g_instCs);
     auto it = g_instKeyById.find(instId);
@@ -347,6 +354,7 @@ static const InstRange* findRange(int instId)
     }
     const InstRange* r = nullptr;
     std::string key = it != g_instKeyById.end() ? it->second : std::string();
+    if (isSolo) *isSolo = key.find("solo") != std::string::npos;
     if (!key.empty()) {
         auto rit = g_rangesByKey.find(key);
         if (rit != g_rangesByKey.end()) r = &rit->second;
@@ -420,6 +428,7 @@ struct TrackInfo {
     int instId = -1;
     bool rangeResolved = false;
     const InstRange* range = nullptr;
+    bool solo = false;
     std::vector<LogEntry> log;
     std::string textArt;
     std::map<int, VoiceQ> voices;
@@ -442,6 +451,8 @@ struct Shadow {
     int auditions = 0;
     long long idleSamples = 0;
     ULONGLONG createdTick = 0;
+    bool everReady = false; // has reported ready at least once
+    bool gaveUp = false;    // timed out once: never block playback on it again
     std::vector<float> in[2], out[2], dl[2];
     size_t dlPos = 0;
 };
@@ -687,7 +698,7 @@ static const InstRange* rangeFor(TrackInfo& ti)
 {
     if (!ti.rangeResolved) {
         ti.rangeResolved = true;
-        ti.range = ti.instId >= 0 ? findRange(ti.instId) : nullptr;
+        ti.range = ti.instId >= 0 ? findRange(ti.instId, &ti.solo) : nullptr;
     }
     return ti.range;
 }
@@ -769,6 +780,22 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
 {
     if (q.items.empty()) return;
     const InstRange* r = ti.range;
+
+    // Optional: no legato transition (slide) across large leaps.
+    if (g_cfg.legatoMaxLeap > 0 && (!g_cfg.legatoMaxLeapSoloOnly || ti.solo)) {
+        for (size_t i = 0; i < q.items.size(); ++i) {
+            if (!q.items[i].isNote) continue;
+            ms_NoteEvent_5& ev = q.items[i].note.ev;
+            if (!(ev._articulation & ms_NoteArticulation_Slur)) continue;
+            for (size_t j = i + 1; j < q.items.size(); ++j) {
+                if (!q.items[j].isNote || q.items[j].note.ev._location_us == ev._location_us) continue;
+                if (std::abs(q.items[j].note.ev._pitch - ev._pitch) > g_cfg.legatoMaxLeap) {
+                    ev._articulation = (ms_NoteArticulation)((uint64_t)ev._articulation & ~(uint64_t)ms_NoteArticulation_Slur);
+                }
+                break;
+            }
+        }
+    }
 
     // Legato context per note: group notes into steps by location.
     std::vector<int> shifts(q.items.size(), 0);
@@ -1192,6 +1219,10 @@ EXPORT ms_Result ms_MuseSampler_finalize_track(ms_MuseSampler ms, ms_Track t)
 EXPORT ms_Result ms_MuseSampler_add_track_note_event_6(ms_MuseSampler ms, ms_Track t, ms_NoteEvent_5 ev, long long& eventId)
 {
     ensureReal();
+    if (g_cfg.enabled && g_cfg.staccatoScale < 1.0
+        && (ev._articulation & (ms_NoteArticulation_Staccato | ms_NoteArticulation_Staccatissimo))) {
+        ev._duration_us = std::max(30000LL, (long long)(ev._duration_us * g_cfg.staccatoScale));
+    }
     Sampler* S = g_cfg.enabled ? findS(ms) : nullptr;
     if (!S) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
     Guard g(S->cs);
@@ -1645,9 +1676,15 @@ EXPORT bool ms_MuseSampler_ready_to_play(ms_MuseSampler ms)
     Guard g(S->cs);
     for (auto& sp : S->shadows) {
         Shadow& sh = *sp.second;
-        if (sh.notes > 0 && !R.ms_MuseSampler_ready_to_play(sh.h)) {
-            if (GetTickCount64() - sh.createdTick < 15000) return false;
-            LOGE("shadow %+d never reported ready; not waiting for it", sh.shift);
+        if (sh.notes <= 0 || sh.gaveUp) continue;
+        if (R.ms_MuseSampler_ready_to_play(sh.h)) {
+            sh.everReady = true;
+            continue;
+        }
+        if (GetTickCount64() - sh.createdTick < (sh.everReady ? 15000ULL : 8000ULL)) return false;
+        if (!sh.everReady) {
+            sh.gaveUp = true;
+            LOGI("shadow %+d does not report ready; not waiting for it again", sh.shift);
         }
     }
     return true;
