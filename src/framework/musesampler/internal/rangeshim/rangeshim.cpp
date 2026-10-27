@@ -170,6 +170,8 @@ struct Config {
     long long trillNoteUs = 80000; // shifted notes this short with the trill mark = a written-out trill
     int trillWrittenOut = 0;       // 1: semitone trills, 2: all trills -> plain slurred notes (exact interval)
     long long trillWrittenOutMaxUs = 250000; // longest single trill note considered part of a trill
+    bool trillPriority = true;     // trill notes: drop accent/tenuto/marcato/staccato marks so the trill wins
+    long long trillGapUs = 30000;  // gap between two back-to-back trills on different notes
 };
 
 static Config g_cfg;
@@ -222,6 +224,8 @@ static void loadConfigAndRanges()
     g_cfg.trillOctave = cfg.geti("general", "trill_octave", 0) != 0;
     g_cfg.trillNoteUs = 1000 * std::max<long long>(0, cfg.geti("general", "trill_note_ms", 80));
     g_cfg.trillWrittenOut = (int)std::min<long long>(2, std::max<long long>(0, cfg.geti("general", "trill_written_out", 0)));
+    g_cfg.trillPriority = cfg.geti("general", "trill_priority", 1) != 0;
+    g_cfg.trillGapUs = 1000 * std::max<long long>(0, std::min<long long>(200, cfg.geti("general", "trill_gap_ms", 30)));
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -248,7 +252,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -970,12 +974,65 @@ static void writeOutTrills(VoiceQ& q)
     }
 }
 
+// trill_priority: a trill note that also carries an accent (etc.) can come out as a plain
+// accented note, so keep only the trill. trill_gap_ms: when one trill runs straight into a
+// trill on another note, Muse Sounds may treat both as one trill and play the second note
+// plain, so end the first trill slightly early.
+static void prioritizeTrills(VoiceQ& q, int instId)
+{
+    const uint64_t TR = (uint64_t)ms_NoteArticulation_Trill;
+    const uint64_t ATTACK = (uint64_t)(ms_NoteArticulation_Staccato | ms_NoteArticulation_Staccatissimo
+                                       | ms_NoteArticulation_Accent | ms_NoteArticulation_Tenuto | ms_NoteArticulation_Marcato);
+    int stripped = 0, gaps = 0;
+    if (g_cfg.trillPriority) {
+        for (auto& it : q.items) {
+            if (!it.isNote) continue;
+            uint64_t a = (uint64_t)it.note.ev._articulation;
+            if ((a & TR) && (a & ATTACK)) { it.note.ev._articulation = (ms_NoteArticulation)(a & ~ATTACK); ++stripped; }
+        }
+    }
+    if (g_cfg.trillGapUs > 0) {
+        // trill notes in order; a trill alternates between two pitches, so a third pitch
+        // right after it (also trilled) starts a new trill.
+        size_t prev = SIZE_MAX;
+        int pa = -1, pb = -1;
+        for (size_t i = 0; i < q.items.size(); ++i) {
+            if (!q.items[i].isNote) continue;
+            ms_NoteEvent_5& ev = q.items[i].note.ev;
+            if (!((uint64_t)ev._articulation & TR)) { prev = SIZE_MAX; pa = pb = -1; continue; }
+            if (prev != SIZE_MAX) {
+                ms_NoteEvent_5& pe = q.items[prev].note.ev;
+                if (pe._location_us == ev._location_us) continue; // chord
+                long long pend = pe._location_us + pe._duration_us;
+                bool contiguous = ev._location_us - pend <= 1000;
+                bool newTrill = pb >= 0 && ev._pitch != pa && ev._pitch != pb;
+                if (contiguous && newTrill) {
+                    long long cut = std::min(g_cfg.trillGapUs, pe._duration_us / 2);
+                    pe._duration_us -= cut;
+                    ++gaps;
+                    pa = ev._pitch; pb = -1;
+                } else if (!contiguous) {
+                    pa = ev._pitch; pb = -1;
+                } else if (pa < 0) pa = ev._pitch;
+                else if (pb < 0 && ev._pitch != pa) pb = ev._pitch;
+            } else {
+                pa = ev._pitch; pb = -1;
+            }
+            prev = i;
+        }
+    }
+    if (stripped || gaps)
+        LOGI("instrument %d: trill priority: %d trill note(s) without accent/tenuto/staccato marks, %d gap(s) between back-to-back trills",
+             instId, stripped, gaps);
+}
+
 // Decides the shift for every queued note of one voice (no engine calls).
 static void planVoice(TrackInfo& ti, VoiceQ& q, std::vector<int>& shifts)
 {
     shifts.assign(q.items.size(), 0);
     if (q.items.empty()) return;
     writeOutTrills(q);
+    prioritizeTrills(q, ti.instId);
     const InstRange* r = ti.range;
 
     // Optional: no legato transition (slide) across large leaps.
