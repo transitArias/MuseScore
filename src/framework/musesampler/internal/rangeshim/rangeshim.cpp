@@ -166,6 +166,8 @@ struct Config {
     long long runJoinUs = 300000;  // ...if they are within this distance of an out-of-range note
     bool trillOctave = false;      // optional: shifted trills are played a whole octave down
     long long trillNoteUs = 80000; // shifted notes this short with the trill mark = a written-out trill
+    int trillWrittenOut = 0;       // 1: semitone trills, 2: all trills -> plain slurred notes (exact interval)
+    long long trillWrittenOutMaxUs = 250000; // longest single trill note considered part of a trill
 };
 
 static Config g_cfg;
@@ -216,6 +218,7 @@ static void loadConfigAndRanges()
     g_cfg.runJoinUs = 1000 * std::max<long long>(0, cfg.geti("general", "run_join_ms", 300));
     g_cfg.trillOctave = cfg.geti("general", "trill_octave", 0) != 0;
     g_cfg.trillNoteUs = 1000 * std::max<long long>(0, cfg.geti("general", "trill_note_ms", 80));
+    g_cfg.trillWrittenOut = (int)std::min<long long>(2, std::max<long long>(0, cfg.geti("general", "trill_written_out", 0)));
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -237,7 +240,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d)", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -410,6 +413,7 @@ struct QItem {
     bool rangeStart = false;
     int voice = 0;
     uint64_t art = 0;
+    bool drop = false; // range item made obsolete by trill_written_out
 };
 
 struct VoiceQ {
@@ -830,11 +834,61 @@ static void emitRange(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voi
     broadcast(S, ti, e);
 }
 
+// Optional (trill_written_out): Muse Sounds gets only a "trill" mark, not the interval, and
+// picks its own half/whole-step recording. MuseScore writes trills out as alternating notes
+// with the interval the score asks for (accidental included), so drop the mark and play
+// those notes as written, slurred.
+static void writeOutTrills(VoiceQ& q)
+{
+    if (g_cfg.trillWrittenOut <= 0) return;
+    const uint64_t TR = (uint64_t)ms_NoteArticulation_Trill, SL = (uint64_t)ms_NoteArticulation_Slur;
+    std::vector<size_t> notes;
+    for (size_t i = 0; i < q.items.size(); ++i) if (q.items[i].isNote) notes.push_back(i);
+    auto ev = [&](size_t n) -> ms_NoteEvent_5& { return q.items[notes[n]].note.ev; };
+    auto single = [&](size_t n) {
+        long long loc = ev(n)._location_us;
+        return (n == 0 || ev(n - 1)._location_us != loc) && (n + 1 >= notes.size() || ev(n + 1)._location_us != loc);
+    };
+    auto trillNote = [&](size_t n) {
+        return (ev(n)._articulation & TR) && ev(n)._duration_us <= g_cfg.trillWrittenOutMaxUs && single(n);
+    };
+    size_t n = 0;
+    while (n < notes.size()) {
+        if (!trillNote(n)) { ++n; continue; }
+        size_t m = n;
+        int pa = ev(n)._pitch, pb = -1;
+        while (m + 1 < notes.size() && trillNote(m + 1)
+               && ev(m + 1)._location_us - (ev(m)._location_us + ev(m)._duration_us) <= g_cfg.runGapUs) {
+            int p = ev(m + 1)._pitch;
+            if (p == ev(m)._pitch) break;
+            if (pb < 0 && p != pa) pb = p;
+            if (p != pa && p != pb) break;
+            ++m;
+        }
+        int interval = pb < 0 ? 0 : std::abs(pb - pa);
+        bool want = m >= n + 2 && interval > 0 && (g_cfg.trillWrittenOut == 2 || interval == 1);
+        if (want) {
+            for (size_t k = n; k <= m; ++k) {
+                uint64_t a = (uint64_t)ev(k)._articulation & ~TR;
+                if (k < m) a |= SL;
+                ev(k)._articulation = (ms_NoteArticulation)a;
+            }
+            // The trill's articulation range markers no longer belong to any note.
+            size_t lo = n == 0 ? 0 : notes[n - 1] + 1, hi = m + 1 < notes.size() ? notes[m + 1] : q.items.size();
+            for (size_t i = lo; i < hi; ++i)
+                if (!q.items[i].isNote && q.items[i].art == TR) q.items[i].drop = true;
+            LOGD("trill at %lldus written out: %d notes, interval %d", ev(n)._location_us, (int)(m - n + 1), interval);
+        }
+        n = m + 1;
+    }
+}
+
 // Decides the shift for every queued note of one voice (no engine calls).
 static void planVoice(TrackInfo& ti, VoiceQ& q, std::vector<int>& shifts)
 {
     shifts.assign(q.items.size(), 0);
     if (q.items.empty()) return;
+    writeOutTrills(q);
     const InstRange* r = ti.range;
 
     // Optional: no legato transition (slide) across large leaps.
@@ -1010,7 +1064,7 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     for (auto& o : outs) {
         QItem& it = o.q->items[o.idx];
         if (it.isNote) emitNote(S, T, ti, it.note, o.shift);
-        else emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
+        else if (!it.drop) emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
     }
     for (auto& v : ti.voices) {
         VoiceQ& q = v.second;
