@@ -769,7 +769,36 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shif
         ev._articulation = (ms_NoteArticulation)((uint64_t)ev._articulation & ~(uint64_t)ms_NoteArticulation_Trill);
     }
     if (R.ms_MuseSampler_add_track_note_event_6(dstS, dstT, ev, realId) != ms_Result_OK) {
-        LOGD("add note failed (pitch %d, shift %d)", n.ev._pitch, shift);
+        // The engine refused the note. Find out which property it objects to by retrying
+        // variants (longer / without articulation marks), and log what it accepted.
+        // Variants, mildest first: slightly longer, then without articulation marks.
+        static const long long lens[] = { 0, 60000, 80000, 120000 };
+        int accepted = -1;
+        long long acceptedLen = 0;
+        for (int plain = 0; plain < 2 && accepted < 0; ++plain) {
+            for (int li = plain ? 0 : 1; li < 4 && accepted < 0; ++li) {
+                ms_NoteEvent_5 e2 = ev;
+                if (lens[li] > 0) e2._duration_us = std::max<long long>(e2._duration_us, lens[li]);
+                if (plain) {
+                    e2._articulation = ms_NoteArticulation_None;
+                    e2._articulation_2 = ms_NoteArticulation2_None;
+                }
+                if (R.ms_MuseSampler_add_track_note_event_6(dstS, dstT, e2, realId) == ms_Result_OK) {
+                    accepted = plain;
+                    acceptedLen = e2._duration_us;
+                }
+            }
+        }
+        static int reported = 0;
+        bool detail = g_logLevel >= 2 || reported < 40;
+        if (detail) {
+            ++reported;
+            LOGI("engine rejected note %s @%.3fs dur %lldms art 0x%llx/0x%llx voice %d track %p shift %+d -> %s",
+                 noteName(ev._pitch).c_str(), ev._location_us / 1e6, ev._duration_us / 1000,
+                 (unsigned long long)ev._articulation, (unsigned long long)ev._articulation_2, ev._voice, dstT, shift,
+                 accepted < 0 ? "every variant rejected"
+                              : ("accepted at " + std::to_string(acceptedLen / 1000) + "ms" + (accepted ? " without marks" : "")).c_str());
+        }
     }
     if (shift != 0) {
         LOGD("note %s @%lldus -> shadow %+d (plays %s) dur %lldms art 0x%llx/0x%llx", noteName(n.ev._pitch).c_str(),
