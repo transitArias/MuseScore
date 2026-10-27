@@ -172,6 +172,8 @@ struct Config {
     long long trillWrittenOutMaxUs = 250000; // longest single trill note considered part of a trill
     bool trillPriority = true;     // trill notes: drop accent/tenuto/marcato/staccato marks so the trill wins
     long long trillGapUs = 30000;  // gap between two back-to-back trills on different notes
+    bool tremoloChords = true;     // chord tremolos: each chord note on its own engine instance
+    int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
 };
 
 static Config g_cfg;
@@ -226,6 +228,8 @@ static void loadConfigAndRanges()
     g_cfg.trillWrittenOut = (int)std::min<long long>(2, std::max<long long>(0, cfg.geti("general", "trill_written_out", 0)));
     g_cfg.trillPriority = cfg.geti("general", "trill_priority", 1) != 0;
     g_cfg.trillGapUs = 1000 * std::max<long long>(0, std::min<long long>(200, cfg.geti("general", "trill_gap_ms", 30)));
+    g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
+    g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -252,7 +256,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -468,8 +472,18 @@ struct TrackInfo {
     std::set<std::string> textsSeen;
 };
 
+// Shadow samplers are keyed by laneKey(shift, lane): `shift` semitones of transposition
+// (0 = none, no pitch shifter at all) on instance number `lane` (0 = the out-of-range
+// shadows; 1.. = extra instances that each play one note of a tremolo chord).
+static const int LANE_STRIDE = 1000;
+static inline int laneKey(int shift, int lane) { return shift + lane * LANE_STRIDE; }
+static inline int keyLane(int key) { return (key + LANE_STRIDE / 2) / LANE_STRIDE; }
+static inline int keyShift(int key) { return key - keyLane(key) * LANE_STRIDE; }
+
 struct Shadow {
-    int shift = 0;
+    int shift = 0; // semitones of transposition (pitch shifter); 0 = played as is
+    int lane = 0;
+    int key = 0;
     ms_MuseSampler h = nullptr;
     std::unique_ptr<Stretch> fx;
     int latency = 0;
@@ -538,6 +552,12 @@ static void configureFx(Sampler& S, Shadow& sh)
 {
     double sr = S.offline && S.offSr > 0 ? S.offSr : S.sr;
     if (sr <= 0) sr = 48000;
+    if (sh.shift == 0) { // tremolo-chord lane: mixed in directly, no shifter, no latency
+        sh.fx.reset();
+        sh.latency = sh.la = sh.d = 0;
+        sh.needsPrime = true;
+        return;
+    }
     int block = std::max(256, (int)(sr * g_cfg.shifterBlockMs / 1000.0));
     int interval = std::max(64, block / 4);
     sh.fx.reset(new Stretch(12345));
@@ -636,14 +656,17 @@ static void runFx(Shadow& sh, int n, ms_OutputBuffer* dst)
 
 // --- shadow lifecycle ---------------------------------------------------------
 
-static Shadow* ensureShadow(Sampler& S, int shift)
+static Shadow* ensureShadow(Sampler& S, int key)
 {
-    auto it = S.shadows.find(shift);
+    const int shift = keyShift(key);
+    auto it = S.shadows.find(key);
     if (it != S.shadows.end()) return it->second.get();
     if (!S.inited || !R.ms_MuseSampler_create) return nullptr;
 
     std::unique_ptr<Shadow> sh(new Shadow());
     sh->shift = shift;
+    sh->lane = keyLane(key);
+    sh->key = key;
     sh->h = R.ms_MuseSampler_create();
     if (!sh->h) {
         LOGE("could not create shadow sampler");
@@ -665,9 +688,13 @@ static Shadow* ensureShadow(Sampler& S, int shift)
     if (S.playing) R.ms_MuseSampler_set_playing(sh->h, 1);
     configureFx(S, *sh);
     sh->createdTick = GetTickCount64();
-    LOGI("sampler %p: created shadow for %+d semitones (shifter latency %d samples)", S.s, shift, sh->latency);
+    if (sh->lane == 0)
+        LOGI("sampler %p: created shadow for %+d semitones (shifter latency %d samples)", S.s, shift, sh->latency);
+    else
+        LOGI("sampler %p: created tremolo-chord instance %d%s", S.s, sh->lane,
+             shift ? (" (also shifted " + std::to_string(shift) + " semitones)").c_str() : "");
     Shadow* raw = sh.get();
-    S.shadows[shift] = std::move(sh);
+    S.shadows[key] = std::move(sh);
     return raw;
 }
 
@@ -838,14 +865,14 @@ static int shiftFor(int pitch, int top, int low, bool trill = false)
     return 0;
 }
 
-static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shift)
+static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key)
 {
     long long realId = 0;
     ms_MuseSampler dstS = S.s;
     ms_Track dstT = T;
-    if (shift != 0) {
-        MirrorTrack* m = ensureMirror(S, ti, shift);
-        Shadow* sh = m ? S.shadows[shift].get() : nullptr;
+    if (key != 0) {
+        MirrorTrack* m = ensureMirror(S, ti, key);
+        Shadow* sh = m ? S.shadows[key].get() : nullptr;
         if (m && sh) {
             dstS = sh->h;
             dstT = m->t;
@@ -853,9 +880,10 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shif
             sh->notes++;
             sh->idleSamples = 0;
         } else {
-            shift = 0;
+            key = 0;
         }
     }
+    const int shift = keyShift(key);
     ms_NoteEvent_5 ev = n.ev;
     ev._pitch -= shift;
     // MuseScore sends trills it can't hand to Muse Sounds natively as tiny written-out notes
@@ -888,20 +916,20 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shif
         bool detail = g_logLevel >= 2 || reported < 40;
         if (detail) {
             ++reported;
-            LOGI("engine rejected note %s @%.3fs dur %lldms art 0x%llx/0x%llx voice %d track %p shift %+d -> %s",
+            LOGI("engine rejected note %s @%.3fs dur %lldms art 0x%llx/0x%llx voice %d track %p shift %+d lane %d -> %s",
                  noteName(ev._pitch).c_str(), ev._location_us / 1e6, ev._duration_us / 1000,
-                 (unsigned long long)ev._articulation, (unsigned long long)ev._articulation_2, ev._voice, dstT, shift,
+                 (unsigned long long)ev._articulation, (unsigned long long)ev._articulation_2, ev._voice, dstT, shift, keyLane(key),
                  accepted < 0 ? "every variant rejected"
                               : ("accepted at " + std::to_string(acceptedLen / 1000) + "ms" + (accepted ? " without marks" : "")).c_str());
         }
     }
-    if (shift != 0) {
-        LOGD("note %s @%lldus -> shadow %+d (plays %s) dur %lldms art 0x%llx/0x%llx", noteName(n.ev._pitch).c_str(),
-             n.ev._location_us, shift, noteName(ev._pitch).c_str(), ev._duration_us / 1000,
+    if (key != 0) {
+        LOGD("note %s @%lldus -> shadow %+d lane %d (plays %s) dur %lldms art 0x%llx/0x%llx", noteName(n.ev._pitch).c_str(),
+             n.ev._location_us, shift, keyLane(key), noteName(ev._pitch).c_str(), ev._duration_us / 1000,
              (unsigned long long)n.ev._articulation, (unsigned long long)n.ev._articulation_2);
     }
     IdRoute& route = ti.ids[n.id];
-    route.shift = shift;
+    route.shift = key;
     route.realId = realId;
     route.pending = false;
     for (auto b : n.bends) {
@@ -1171,6 +1199,53 @@ static void planVoice(TrackInfo& ti, VoiceQ& q, std::vector<int>& shifts)
 
 }
 
+// Chord tremolos (tremolo_chords). Muse Sounds decides between a one-note and a two-note
+// (fingered) tremolo from the notes it gets under the tremolo mark, so a chord with a
+// one-chord tremolo (slashes on the stem) comes out as an alternation between the chord's
+// notes. MuseScore sends such a chord as repeated steps that each hold all chord notes at
+// once; a genuine two-chord (beamed) tremolo is sent as steps alternating between the two
+// chords. Each simultaneous tremolo note gets its own engine instance ("lane") by its rank
+// in the chord, top note first (lane 0 = the normal instrument): every lane then sees a
+// single repeated note (one-note tremolo), or, for a two-chord tremolo between chords, one
+// note of each chord alternating (two-note tremolo, as written).
+static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes)
+{
+    lanes.assign(q.items.size(), 0);
+    if (!g_cfg.tremoloChords) return 0;
+    const uint64_t TREM = (uint64_t)(ms_NoteArticulation_Tremolo1 | ms_NoteArticulation_Tremolo2
+                                     | ms_NoteArticulation_Tremolo3 | ms_NoteArticulation_BuzzTremolo);
+    int split = 0, chords = 0;
+    size_t i = 0;
+    while (i < q.items.size()) {
+        if (!q.items[i].isNote) { ++i; continue; }
+        const long long loc = q.items[i].note.ev._location_us;
+        std::vector<size_t> step;
+        size_t j = i;
+        for (; j < q.items.size(); ++j) {
+            if (!q.items[j].isNote) continue;
+            if (q.items[j].note.ev._location_us != loc) break;
+            if ((uint64_t)q.items[j].note.ev._articulation & TREM) step.push_back(j);
+        }
+        if (step.size() >= 2) {
+            std::stable_sort(step.begin(), step.end(), [&](size_t a, size_t b) {
+                return q.items[a].note.ev._pitch > q.items[b].note.ev._pitch;
+            });
+            int rank = 0, lastPitch = INT_MIN;
+            for (size_t k : step) {
+                int p = q.items[k].note.ev._pitch;
+                if (lastPitch != INT_MIN && p != lastPitch) ++rank; // unison doublings share a lane
+                lastPitch = p;
+                lanes[k] = std::min(rank, g_cfg.tremoloMaxLanes - 1);
+                if (lanes[k] > 0) ++split;
+            }
+            ++chords;
+        }
+        i = j;
+    }
+    if (chords) LOGD("instrument %d: %d tremolo chord step(s), %d note(s) on extra instances", ti.instId, chords, split);
+    return split;
+}
+
 // Sends everything queued for a track. Each voice is planned as a whole, but the engine
 // needs a track's events in time order (it rejects notes earlier than ones it already
 // has), so the voices are merged back into one time-ordered stream before sending.
@@ -1186,11 +1261,15 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     std::vector<Out> outs;
     std::map<VoiceQ*, std::vector<int> > plans;
     size_t seq = 0;
+    int tremoloSplit = 0;
     for (auto& v : ti.voices) {
         VoiceQ& q = v.second;
         if (q.items.empty()) continue;
         std::vector<int>& shifts = plans[&q];
         planVoice(ti, q, shifts);
+        std::vector<int> lanes;
+        tremoloSplit += assignTremoloLanes(ti, q, lanes);
+        for (size_t i = 0; i < shifts.size(); ++i) shifts[i] = laneKey(shifts[i], lanes[i]);
         // Non-note items (articulation ranges) take the time of the next note in their voice.
         long long nextT = LLONG_MIN, lastT = 0;
         std::vector<long long> keys(q.items.size(), 0);
@@ -1210,6 +1289,9 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
         if (it.isNote) emitNote(S, T, ti, it.note, o.shift);
         else if (!it.drop) emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
     }
+    if (tremoloSplit)
+        LOGI("instrument %d: %d tremolo chord note(s) played on their own instance (one-note tremolo per chord note)",
+             ti.instId, tremoloSplit);
     for (auto& v : ti.voices) {
         VoiceQ& q = v.second;
         q.items.clear();
@@ -1248,11 +1330,37 @@ static void teleReport(Sampler& S, Shadow& sh, long long pos)
     sh.teleN = 0;
 }
 
+// Unshifted instance (tremolo-chord lane): render in step with the main sampler and add.
+static void addDirect(Shadow& sh, int n, ms_OutputBuffer& dst)
+{
+    if (!dst._channels) return;
+    int nc = std::min(dst._num_channels, 2);
+    int nn = std::min(n, dst._num_data_pts);
+    for (int c = 0; c < nc; ++c) {
+        float* o = dst._channels[c];
+        for (int i = 0; i < nn; ++i) o[i] += sh.in[c][i];
+    }
+    if (dst._num_channels == 1)
+        for (int i = 0; i < nn; ++i) dst._channels[0][i] += sh.in[1][i];
+}
+
 static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long long pos)
 {
     int n = out._num_data_pts;
     if (n <= 0) return;
     ensureBuffers(sh, n);
+    if (!sh.fx) {
+        bool discontinuous = S.playing && sh.expectedPos != LLONG_MIN && pos != sh.expectedPos;
+        if (S.playing && (sh.needsPrime || discontinuous) && (!sh.untouchedSinceSet || sh.lastSetPos != pos)) {
+            R.ms_MuseSampler_set_position(sh.h, pos);
+            sh.lastSetPos = pos;
+        }
+        if (S.playing) sh.needsPrime = false;
+        renderShadow(sh, n, false, pos, S.playing);
+        addDirect(sh, n, out);
+        sh.expectedPos = S.playing ? pos + n : pos;
+        return;
+    }
     bool discontinuous = S.playing && sh.expectedPos != LLONG_MIN && pos != sh.expectedPos;
     if (sh.la == 0 || (S.playing && (sh.needsPrime || discontinuous)) || (sh.la % n) != 0) {
         resetFx(sh, n);
@@ -1279,6 +1387,16 @@ static void mixShadowOffline(Sampler& S, Shadow& sh, ms_OutputBuffer& out)
     int n = out._num_data_pts;
     if (n <= 0) return;
     ensureBuffers(sh, n);
+    if (!sh.fx) {
+        if (sh.needsPrime) {
+            R.ms_MuseSampler_set_position(sh.h, S.offPos);
+            sh.lastSetPos = S.offPos;
+            sh.needsPrime = false;
+        }
+        renderShadow(sh, n, true, 0);
+        addDirect(sh, n, out);
+        return;
+    }
     if (sh.needsPrime || sh.la == 0 || (sh.la % n) != 0) {
         resetFx(sh, n);
         R.ms_MuseSampler_set_position(sh.h, S.offPos);
