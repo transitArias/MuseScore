@@ -161,6 +161,9 @@ struct Config {
     double staccatoScale = 1.0; // multiply written length of staccato(issimo) notes
     int legatoMaxLeap = 0;      // >0: no legato transition for leaps larger than this (semitones)
     bool legatoMaxLeapSoloOnly = true;
+    long long runGapUs = 30000;    // notes this close count as one continuous run
+    long long fastNoteUs = 160000; // notes this short can join a shifted run
+    long long runJoinUs = 300000;  // ...if they are within this distance of an out-of-range note
 };
 
 static Config g_cfg;
@@ -206,6 +209,9 @@ static void loadConfigAndRanges()
     g_cfg.staccatoScale = std::min(1.0, std::max(0.05, cfg.getd("general", "staccato_scale", 1.0)));
     g_cfg.legatoMaxLeap = (int)std::max<long long>(0, cfg.geti("general", "legato_max_leap", 0));
     g_cfg.legatoMaxLeapSoloOnly = cfg.geti("general", "legato_max_leap_solo_only", 1) != 0;
+    g_cfg.runGapUs = 1000 * std::max<long long>(0, cfg.geti("general", "run_gap_ms", 30));
+    g_cfg.fastNoteUs = 1000 * std::max<long long>(0, cfg.geti("general", "fast_note_ms", 160));
+    g_cfg.runJoinUs = 1000 * std::max<long long>(0, cfg.geti("general", "run_join_ms", 300));
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -822,36 +828,87 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
         if (shifts[i] != 0) any = true;
     }
 
-    // Keep a legato phrase together in one shadow so its transitions survive.
-    bool slurConnected = false;
-    {
-        long long firstLoc = LLONG_MIN;
-        bool multiStep = false, slurSeen = false;
-        for (auto& it : q.items) {
-            if (!it.isNote) continue;
-            if (firstLoc == LLONG_MIN) firstLoc = it.note.ev._location_us;
-            else if (it.note.ev._location_us != firstLoc) multiStep = true;
-            if (it.note.ev._articulation & ms_NoteArticulation_Slur) slurSeen = true;
+    // Steps: notes of the voice grouped by start time (chords / doublings share a step).
+    struct Step {
+        std::vector<size_t> idx;
+        long long loc = 0, end = 0;
+        bool slur = false;
+    };
+    std::vector<Step> steps;
+    for (size_t i = 0; i < q.items.size(); ++i) {
+        if (!q.items[i].isNote) continue;
+        const ms_NoteEvent_5& ev = q.items[i].note.ev;
+        if (steps.empty() || steps.back().loc != ev._location_us) {
+            steps.push_back(Step());
+            steps.back().loc = ev._location_us;
+            steps.back().end = ev._location_us;
         }
-        slurConnected = multiStep && slurSeen;
+        Step& st = steps.back();
+        st.idx.push_back(i);
+        st.end = std::max(st.end, ev._location_us + ev._duration_us);
+        if (ev._articulation & ms_NoteArticulation_Slur) st.slur = true;
     }
-    if (any && g_cfg.octaveMode && g_cfg.legatoPhrases && slurConnected) {
-        int cand = 0;
-        for (size_t i = 0; i < q.items.size(); ++i) {
-            if (!q.items[i].isNote) continue;
-            if (std::abs(shifts[i]) > std::abs(cand)) cand = shifts[i];
+    auto fits = [&](size_t i, int sh) {
+        int p = q.items[i].note.ev._pitch - sh;
+        return (low < 0 || p >= low) && (tops[i] < 0 || p <= tops[i]);
+    };
+
+    // (octave mode, legato_phrases=1) keep a slurred phrase together in one shadow.
+    if (any && g_cfg.octaveMode && g_cfg.legatoPhrases) {
+        size_t a0 = 0;
+        while (a0 < steps.size()) {
+            size_t b0 = a0;
+            while (b0 + 1 < steps.size() && steps[b0].slur && std::llabs(steps[b0 + 1].loc - steps[b0].end) <= 60000) ++b0;
+            if (b0 > a0) {
+                int cand = 0;
+                for (size_t k = a0; k <= b0; ++k)
+                    for (size_t i : steps[k].idx) if (std::abs(shifts[i]) > std::abs(cand)) cand = shifts[i];
+                bool ok = cand != 0;
+                for (size_t k = a0; k <= b0 && ok; ++k)
+                    for (size_t i : steps[k].idx) if (!fits(i, cand)) ok = false;
+                if (ok) for (size_t k = a0; k <= b0; ++k) for (size_t i : steps[k].idx) shifts[i] = cand;
+            }
+            a0 = b0 + 1;
         }
-        bool ok = true;
-        int nNotes = 0;
-        for (size_t i = 0; i < q.items.size() && ok; ++i) {
-            if (!q.items[i].isNote) continue;
-            ++nNotes;
-            int p = q.items[i].note.ev._pitch - cand;
-            if (tops[i] >= 0 && p > tops[i]) ok = false;
-            if (low >= 0 && p < low) ok = false;
-        }
-        if (ok && nNotes > 1) {
-            for (size_t i = 0; i < q.items.size(); ++i) if (q.items[i].isNote) shifts[i] = cand;
+    }
+
+    // Fast runs and written-out trills that cross the top go through ONE shadow as a
+    // continuous stream (a pitch shifter can't render isolated 90 ms fragments). Within
+    // such a run the out-of-range notes share the largest shift, and short in-range notes
+    // close to them join; long in-range notes stay on the real instrument.
+    if (any) {
+        size_t a0 = 0;
+        while (a0 < steps.size()) {
+            size_t b0 = a0;
+            while (b0 + 1 < steps.size() && steps[b0 + 1].loc >= steps[b0].loc
+                   && steps[b0 + 1].loc - steps[b0].end <= g_cfg.runGapUs) ++b0;
+            if (b0 > a0) {
+                int runShift = 0;
+                std::vector<std::pair<long long, long long> > outSpans;
+                for (size_t k = a0; k <= b0; ++k)
+                    for (size_t i : steps[k].idx)
+                        if (shifts[i] != 0) {
+                            if (std::abs(shifts[i]) > std::abs(runShift)) runShift = shifts[i];
+                            const ms_NoteEvent_5& ev = q.items[i].note.ev;
+                            outSpans.push_back(std::make_pair(ev._location_us, ev._location_us + ev._duration_us));
+                        }
+                if (runShift != 0) {
+                    for (size_t k = a0; k <= b0; ++k)
+                        for (size_t i : steps[k].idx) {
+                            const ms_NoteEvent_5& ev = q.items[i].note.ev;
+                            bool join = shifts[i] != 0;
+                            if (!join && ev._duration_us <= g_cfg.fastNoteUs) {
+                                long long s0 = ev._location_us, e0 = s0 + ev._duration_us;
+                                for (auto& sp : outSpans) {
+                                    long long d = s0 > sp.second ? s0 - sp.second : (sp.first > e0 ? sp.first - e0 : 0);
+                                    if (d <= g_cfg.runJoinUs) { join = true; break; }
+                                }
+                            }
+                            if (join && fits(i, runShift)) shifts[i] = runShift;
+                        }
+                }
+            }
+            a0 = b0 + 1;
         }
     }
 
@@ -1233,11 +1290,8 @@ EXPORT ms_Result ms_MuseSampler_add_track_note_event_6(ms_MuseSampler ms, ms_Tra
         const bool slur = (ev._articulation & ms_NoteArticulation_Slur) != 0;
         const long long loc = ev._location_us;
         const long long end = loc + ev._duration_us;
-        if (q.hasNotes) {
-            bool sameStep = loc == q.lastLoc;
-            bool legatoCont = g_cfg.legatoPhrases && q.lastSlur && loc > q.lastLoc && std::llabs(loc - q.lastEnd) <= 60000;
-            if (!sameStep && !legatoCont) flushVoice(*S, t, *ti, q);
-        }
+        // The whole voice is held until finalize_track so that runs and phrases can be
+        // judged as a whole (MuseScore always finalizes after loading a track).
         QItem item;
         item.isNote = true;
         item.note.ev = ev;
