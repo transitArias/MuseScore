@@ -20,6 +20,8 @@ extern "C" void* msr_wrap(const char*, void* real) { return real; }
 #include <cstdarg>
 #include <memory>
 #include <unordered_map>
+#include <set>
+#include <algorithm>
 
 #include "common.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
@@ -173,6 +175,7 @@ struct Config {
 static Config g_cfg;
 static std::wstring g_dir;
 static std::map<std::string, InstRange> g_rangesByKey; // lower-case "pack|name"
+static std::map<std::string, double> g_muteGainByKey; // "pack|name" -> linear gain while muted (con sord.)
 static std::map<int, InstRange> g_rangesById;
 static std::string g_rangesLibVersion;
 static std::string g_engineVer;
@@ -236,6 +239,11 @@ static void loadConfigAndRanges()
         if (s == "general" || s.empty()) continue;
         InstRange& r = g_rangesByKey[s];
         applyRangeSection(r, cfg.sec[s]);
+        double gdb = cfg.getd(s, "con_sord_gain_db", 0.0);
+        if (gdb != 0.0) {
+            g_muteGainByKey[lower(s)] = std::pow(10.0, std::max(-40.0, std::min(24.0, gdb)) / 20.0);
+            LOGI("config: %s con sord. gain %+.1f dB", s.c_str(), gdb);
+        }
     }
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
@@ -448,6 +456,12 @@ struct TrackInfo {
     std::map<int, VoiceQ> voices;
     std::unordered_map<long long, IdRoute> ids;
     std::map<int, MirrorTrack> mirrors; // shift -> mirror track in that shadow
+    bool muteResolved = false;
+    double muteGain = 1.0;                                // con_sord_gain_db for this instrument
+    std::vector<std::pair<long long, bool> > muteSpans;   // (time, muted from here on), sorted
+    struct MuteNote { long long start, endTail; bool muted; bool operator<(const MuteNote& o) const { return start < o.start; } };
+    std::vector<MuteNote> muteNotes;                       // notes with/without the Mute mark, sorted by start
+    std::set<std::string> textsSeen;
 };
 
 struct Shadow {
@@ -490,6 +504,7 @@ struct Sampler {
     std::map<int, std::unique_ptr<Shadow> > shadows;
     std::unordered_map<ms_Track, TrackInfo> tracks;
     std::map<std::pair<ms_Track, int>, int> audition; // (track, pitch) -> shift
+    float muteGainNow = 1.0f; // current (ramped) con sord. gain on this sampler's output
 };
 
 static CritSec g_mapCs;
@@ -733,6 +748,69 @@ static const InstRange* rangeFor(TrackInfo& ti)
         ti.range = ti.instId >= 0 ? findRange(ti.instId, &ti.solo) : nullptr;
     }
     return ti.range;
+}
+
+// con_sord_gain_db: per-instrument gain while a "con sord." / mute text articulation is active.
+static double muteGainFor(TrackInfo& ti)
+{
+    if (!ti.muteResolved && ti.instId >= 0) {
+        ti.muteResolved = true;
+        rangeFor(ti); // makes sure instruments are enumerated
+        Guard g(g_instCs);
+        auto it = g_instKeyById.find(ti.instId);
+        if (it != g_instKeyById.end()) {
+            auto git = g_muteGainByKey.find(lower(it->second));
+            if (git != g_muteGainByKey.end()) ti.muteGain = git->second;
+        }
+    }
+    return ti.muteGain;
+}
+
+static bool isMuteText(const std::string& text)
+{
+    std::string t = lower(text);
+    if (t.find("senza") != std::string::npos || t.find("open") != std::string::npos || t.find("unmute") != std::string::npos) return false;
+    return t.find("sord") != std::string::npos || t.find("mute") != std::string::npos;
+}
+
+static void applyMuteGain(Sampler& S, ms_OutputBuffer& buf, long long tUs)
+{
+    float target = 1.0f;
+    for (auto& tp : S.tracks) {
+        TrackInfo& ti = tp.second;
+        if (ti.muteGain == 1.0) continue;
+        bool muted = false;
+        // MuseScore sends "con sord." as the Mute mark on each note: the latest note that
+        // has started decides, until its end plus a release tail.
+        if (!ti.muteNotes.empty()) {
+            TrackInfo::MuteNote key { tUs, 0, false };
+            auto it = std::upper_bound(ti.muteNotes.begin(), ti.muteNotes.end(), key);
+            if (it != ti.muteNotes.begin()) {
+                auto jt = std::prev(it);
+                long long st = jt->start, endTail = jt->endTail;
+                bool m = jt->muted;
+                while (jt != ti.muteNotes.begin() && std::prev(jt)->start == st) { --jt; endTail = std::max(endTail, jt->endTail); m = m || jt->muted; }
+                if (m && tUs <= endTail) muted = true;
+            }
+        }
+        // ... or as a text articulation, for instruments that list one.
+        if (!muted && !ti.muteSpans.empty()) {
+            auto it = std::upper_bound(ti.muteSpans.begin(), ti.muteSpans.end(), std::make_pair(tUs, true));
+            if (it != ti.muteSpans.begin() && std::prev(it)->second) muted = true;
+        }
+        if (muted) { target = (float)ti.muteGain; break; }
+    }
+    float g0 = S.muteGainNow;
+    if (g0 == 1.0f && target == 1.0f) return;
+    int n = buf._num_data_pts;
+    if (buf._channels && n > 0) {
+        for (int c = 0; c < buf._num_channels; ++c) {
+            float* o = buf._channels[c];
+            if (!o) continue;
+            for (int i = 0; i < n; ++i) o[i] *= g0 + (target - g0) * (float)(i + 1) / (float)n;
+        }
+    }
+    S.muteGainNow = target;
 }
 
 // --- routing ------------------------------------------------------------------
@@ -1406,6 +1484,8 @@ EXPORT ms_Result ms_MuseSampler_clear_track(ms_MuseSampler ms, ms_Track t)
     ti->ids.clear();
     ti->log.clear();
     ti->textArt.clear();
+    ti->muteSpans.clear();
+    ti->muteNotes.clear();
     for (auto& mp : ti->mirrors) {
         auto sit = S->shadows.find(mp.first);
         if (sit == S->shadows.end()) continue;
@@ -1454,6 +1534,13 @@ EXPORT ms_Result ms_MuseSampler_add_track_note_event_6(ms_MuseSampler ms, ms_Tra
     if (!S) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
     Guard g(S->cs);
     TrackInfo* ti = trackInfo(*S, t);
+    if (ti && muteGainFor(*ti) != 1.0) {
+        TrackInfo::MuteNote mn { ev._location_us, ev._location_us + ev._duration_us + 300000,
+                                 (ev._articulation & ms_NoteArticulation_Mute) != 0 };
+        ti->muteNotes.insert(std::upper_bound(ti->muteNotes.begin(), ti->muteNotes.end(), mn), mn);
+        if (mn.muted && ti->textsSeen.insert("<mute mark>").second)
+            LOGI("instrument %d: notes with the mute mark (con sord.) -> con sord. gain", ti->instId);
+    }
     if (!ti || !rangeFor(*ti)) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
     try {
         VoiceQ& q = ti->voices[ev._voice];
@@ -1633,6 +1720,12 @@ EXPORT ms_Result ms_MuseSampler_add_track_text_articulation_event(ms_MuseSampler
         e.t = ev._start_us;
         e.s = ev._articulation ? ev._articulation : "";
         ti.textArt = e.s;
+        if (muteGainFor(ti) != 1.0) {
+            auto span = std::make_pair(ev._start_us, isMuteText(e.s));
+            ti.muteSpans.insert(std::upper_bound(ti.muteSpans.begin(), ti.muteSpans.end(), span), span);
+            if (ti.textsSeen.insert(e.s).second)
+                LOGI("instrument %d: text articulation \"%s\" -> %s", ti.instId, e.s.c_str(), span.second ? "con sord. gain" : "normal");
+        }
         return e;
     });
     return r;
@@ -1889,6 +1982,7 @@ EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuff
     } catch (...) {
         LOGE("exception in offline shadow render");
     }
+    applyMuteGain(*S, buf, (long long)(offSec * 1e6));
     if (!S->shadows.empty()) sanitize(*S, buf, "shift", offSec);
     S->offPos += buf._num_data_pts;
     return r;
@@ -1912,6 +2006,7 @@ EXPORT ms_Result ms_MuseSampler_process(ms_MuseSampler ms, ms_OutputBuffer buf, 
     } catch (...) {
         LOGE("exception in shadow render");
     }
+    applyMuteGain(*S, buf, (long long)(liveSec * 1e6));
     if (!S->shadows.empty()) sanitize(*S, buf, "shift", liveSec);
     return r;
 }
