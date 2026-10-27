@@ -22,6 +22,8 @@
 
 #include "chordarticulationsrenderer.h"
 
+#include <vector>
+
 #include "bendsrenderer.h"
 #include "noterenderer.h"
 #include "gracechordcontext.h"
@@ -87,6 +89,34 @@ void ChordArticulationsRenderer::renderChord(const Chord* chord, const Rendering
     }
 }
 
+// Grace chords are rendered with a copy of the principal chord's context.
+// Ornaments (trills etc.), tremolos and arpeggios belong to the principal chord
+// only; without this, a grace note before a trilled note is trilled itself.
+static RenderingContext graceCtxWithoutPrincipalOnlyArticulations(const RenderingContext& ctx)
+{
+    RenderingContext result(ctx);
+
+    std::vector<muse::mpe::ArticulationType> toErase;
+    for (auto it = result.commonArticulations.cbegin(); it != result.commonArticulations.cend(); ++it) {
+        const muse::mpe::ArticulationType type = it->first;
+        if (OrnamentsRenderer::isAbleToRender(type) || TremoloRenderer::isAbleToRender(type)
+            || ArpeggioRenderer::isAbleToRender(type)) {
+            toErase.push_back(type);
+        }
+    }
+
+    if (toErase.empty()) {
+        return result;
+    }
+
+    for (const muse::mpe::ArticulationType type : toErase) {
+        result.commonArticulations.erase(type);
+    }
+    result.commonArticulations.preCalculateAverageData();
+
+    return result;
+}
+
 void ChordArticulationsRenderer::renderChordWithGraceChords(const Chord* chord, const muse::mpe::ArticulationType type,
                                                             const RenderingContext& ctx,
                                                             muse::mpe::PlaybackEventList& result)
@@ -95,13 +125,13 @@ void ChordArticulationsRenderer::renderChordWithGraceChords(const Chord* chord, 
 
     if (isGraceNotePlacedBeforePrincipalNote(type)) {
         for (const auto& pair : graceChordCtx.graceChordCtxList) {
-            renderChord(pair.first, pair.second, result);
+            renderChord(pair.first, graceCtxWithoutPrincipalOnlyArticulations(pair.second), result);
         }
         renderChord(chord, graceChordCtx.principalChordCtx, result);
     } else {
         renderChord(chord, graceChordCtx.principalChordCtx, result);
         for (const auto& pair : graceChordCtx.graceChordCtxList) {
-            renderChord(pair.first, pair.second, result);
+            renderChord(pair.first, graceCtxWithoutPrincipalOnlyArticulations(pair.second), result);
         }
     }
 }
