@@ -470,6 +470,9 @@ struct TrackInfo {
     struct MuteNote { long long start, endTail; bool muted; bool operator<(const MuteNote& o) const { return start < o.start; } };
     std::vector<MuteNote> muteNotes;                       // notes with/without the Mute mark, sorted by start
     std::set<std::string> textsSeen;
+    // What was actually sent to the engine (for the bad-audio report).
+    struct SentNote { long long loc, dur; int pitch; uint64_t a1, a2; int voice, key; bool ok; };
+    std::vector<SentNote> sent;
 };
 
 // Shadow samplers are keyed by laneKey(shift, lane): `shift` semitones of transposition
@@ -523,6 +526,7 @@ struct Sampler {
     std::unordered_map<ms_Track, TrackInfo> tracks;
     std::map<std::pair<ms_Track, int>, int> audition; // (track, pitch) -> shift
     float muteGainNow = 1.0f; // current (ramped) con sord. gain on this sampler's output
+    long long lastBadDetailUs = LLONG_MIN; // bad-audio report: last time a detailed report was written
 };
 
 static CritSec g_mapCs;
@@ -922,6 +926,11 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key)
                  accepted < 0 ? "every variant rejected"
                               : ("accepted at " + std::to_string(acceptedLen / 1000) + "ms" + (accepted ? " without marks" : "")).c_str());
         }
+    }
+    {
+        bool ok = realId != 0;
+        ti.sent.push_back(TrackInfo::SentNote { ev._location_us, ev._duration_us, n.ev._pitch, (uint64_t)ev._articulation,
+                                                (uint64_t)ev._articulation_2, ev._voice, key, ok });
     }
     if (key != 0) {
         LOGD("note %s @%lldus -> shadow %+d lane %d (plays %s) dur %lldms art 0x%llx/0x%llx", noteName(n.ev._pitch).c_str(),
@@ -1661,6 +1670,7 @@ EXPORT ms_Result ms_MuseSampler_clear_track(ms_MuseSampler ms, ms_Track t)
     ti->textArt.clear();
     ti->muteSpans.clear();
     ti->muteNotes.clear();
+    ti->sent.clear();
     for (auto& mp : ti->mirrors) {
         auto sit = S->shadows.find(mp.first);
         if (sit == S->shadows.end()) continue;
@@ -1716,7 +1726,12 @@ EXPORT ms_Result ms_MuseSampler_add_track_note_event_6(ms_MuseSampler ms, ms_Tra
         if (mn.muted && ti->textsSeen.insert("<mute mark>").second)
             LOGI("instrument %d: notes with the mute mark (con sord.) -> con sord. gain", ti->instId);
     }
-    if (!ti || !rangeFor(*ti)) return R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
+    if (!ti || !rangeFor(*ti)) {
+        ms_Result r = R.ms_MuseSampler_add_track_note_event_6(ms, t, ev, eventId);
+        if (ti) ti->sent.push_back(TrackInfo::SentNote { ev._location_us, ev._duration_us, ev._pitch, (uint64_t)ev._articulation,
+                                                         (uint64_t)ev._articulation_2, ev._voice, 0, r == ms_Result_OK });
+        return r;
+    }
     try {
         VoiceQ& q = ti->voices[ev._voice];
         const bool slur = (ev._articulation & ms_NoteArticulation_Slur) != 0;
@@ -2124,20 +2139,102 @@ EXPORT ms_Result ms_MuseSampler_stop_offline_mode(ms_MuseSampler ms)
 // Zero such samples and log where they came from ("engine" = Muse Sounds itself,
 // "shift" = our shadow/pitch-shift mix), so the rest of the mix survives.
 static std::atomic<int> g_badLogs { 0 };
+static std::string instName(int instId)
+{
+    Guard g(g_instCs);
+    auto it = g_instKeyById.find(instId);
+    return it != g_instKeyById.end() ? it->second : ("instrument " + std::to_string(instId));
+}
+
+static std::string artNames(uint64_t a1, uint64_t a2)
+{
+    std::string r;
+    uint64_t known = 0;
+    static const struct { uint64_t bit; const char* name; } trem[] = {
+        { (uint64_t)ms_NoteArticulation_Tremolo1, "tremolo8" }, { (uint64_t)ms_NoteArticulation_Tremolo2, "tremolo16" },
+        { (uint64_t)ms_NoteArticulation_Tremolo3, "tremolo32" }, { (uint64_t)ms_NoteArticulation_BuzzTremolo, "buzz" } };
+    for (const auto& tr : trem)
+        if (a1 & tr.bit) { known |= tr.bit; r += std::string(r.empty() ? "" : "+") + tr.name; }
+    for (const auto& bc : kBitClasses) {
+        if (bc.bits & known) continue;
+        if (a1 & bc.bits) {
+            known |= bc.bits;
+            if (r.find(bc.name) == std::string::npos) r += std::string(r.empty() ? "" : "+") + bc.name;
+        }
+    }
+    if (a1 & ms_NoteArticulation_Slur) { known |= ms_NoteArticulation_Slur; r += std::string(r.empty() ? "" : "+") + "slur"; }
+    char hex[48];
+    if ((a1 & ~known) || a2) {
+        snprintf(hex, sizeof(hex), "%s0x%llx/0x%llx", r.empty() ? "" : "+", (unsigned long long)(a1 & ~known), (unsigned long long)a2);
+        r += hex;
+    }
+    return r.empty() ? "plain" : r;
+}
+
+// Which instrument(s) this sampler plays, and what the engine had around tUs: the notes it was
+// sent (with their articulations and lengths as sent) and the dynamics values. Written once
+// per sampler per 1.5 s of score time, so a cluster of bad blocks gives one report.
+static void reportBadAudio(Sampler& S, long long tUs, long long spanUs)
+{
+    static std::atomic<int> reports { 0 };
+    if (S.lastBadDetailUs != LLONG_MIN && std::llabs(tUs - S.lastBadDetailUs) < 1500000) return;
+    S.lastBadDetailUs = tUs;
+    if (reports.fetch_add(1) >= 60) return;
+    const long long a = tUs - 600000, b = tUs + spanUs + 300000;
+    for (auto& tp : S.tracks) {
+        TrackInfo& ti = tp.second;
+        LOGI("  bad-audio report for %s at %.3fs (notes sent to the engine from %.2fs to %.2fs):",
+             instName(ti.instId).c_str(), tUs / 1e6, a / 1e6, b / 1e6);
+        int shown = 0;
+        for (const auto& n : ti.sent) {
+            if (n.loc + n.dur < a || n.loc > b) continue;
+            if (++shown > 24) { LOGI("    ..."); break; }
+            LOGI("    %s @%.3fs dur %lldms voice %d %s%s%s", noteName(n.pitch).c_str(), n.loc / 1e6, n.dur / 1000, n.voice,
+                 artNames(n.a1, n.a2).c_str(), n.key ? (" -> shadow " + std::to_string(keyShift(n.key)) + "/lane " + std::to_string(keyLane(n.key))).c_str() : "",
+                 n.ok ? "" : " (REJECTED by engine)");
+        }
+        if (!shown) LOGI("    (no notes)");
+        double before = -1;
+        std::string dyn;
+        for (const auto& e : ti.log) {
+            if (e.kind != LogEntry::Dyn) continue;
+            if (e.t <= a) before = e.v;
+            else if (e.t <= b) { char buf[64]; snprintf(buf, sizeof(buf), " %.3fs=%.3f", e.t / 1e6, e.v); dyn += buf; }
+        }
+        LOGI("    dynamics: %s%s", before >= 0 ? ("level " + std::to_string(before) + " before;").c_str() : "none before;", dyn.empty() ? " no changes in the window" : dyn.c_str());
+    }
+}
+
 static void sanitize(Sampler& S, ms_OutputBuffer& buf, const char* stage, double posSec)
 {
     if (!buf._channels) return;
-    int bad = 0;
+    int bad = 0, nans = 0, infs = 0, first = -1, last = -1;
     for (int c = 0; c < buf._num_channels; ++c) {
         float* o = buf._channels[c];
         if (!o) continue;
         for (int i = 0; i < buf._num_data_pts; ++i) {
             float x = o[i];
-            if (!std::isfinite(x) || std::fabs(x) > 32.0f) { o[i] = 0.0f; ++bad; }
+            if (!std::isfinite(x) || std::fabs(x) > 32.0f) {
+                if (std::isnan(x)) ++nans; else if (std::isinf(x)) ++infs;
+                if (first < 0 || i < first) first = i;
+                if (i > last) last = i;
+                o[i] = 0.0f;
+                ++bad;
+            }
         }
     }
-    if (bad && g_badLogs.fetch_add(1) < 200)
-        LOGI("bad audio from %s (sampler %p, %d shadow(s)) at %.3fs: %d sample(s) zeroed", stage, (void*)&S, (int)S.shadows.size(), posSec, bad);
+    if (!bad) return;
+    if (g_badLogs.fetch_add(1) < 400) {
+        std::string who;
+        for (auto& tp : S.tracks) who += (who.empty() ? "" : ", ") + instName(tp.second.instId);
+        LOGI("bad audio from %s (%s; %d shadow(s)) at %.3fs: %d sample(s) zeroed (%d NaN, %d inf, %d huge), frames %d-%d of %d",
+             stage, who.empty() ? "no tracks" : who.c_str(), (int)S.shadows.size(), posSec, bad, nans, infs, bad - nans - infs,
+             first, last, buf._num_data_pts);
+    }
+    if (std::strcmp(stage, "engine") == 0) {
+        double sr = S.offline && S.offSr > 0 ? S.offSr : (S.sr > 0 ? S.sr : 48000);
+        reportBadAudio(S, (long long)(posSec * 1e6), (long long)(buf._num_data_pts / sr * 1e6));
+    }
 }
 
 EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuffer buf)
