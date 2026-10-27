@@ -801,8 +801,10 @@ static void emitRange(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voi
     broadcast(S, ti, e);
 }
 
-static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
+// Decides the shift for every queued note of one voice (no engine calls).
+static void planVoice(TrackInfo& ti, VoiceQ& q, std::vector<int>& shifts)
 {
+    shifts.assign(q.items.size(), 0);
     if (q.items.empty()) return;
     const InstRange* r = ti.range;
 
@@ -823,7 +825,6 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
     }
 
     // Legato context per note: group notes into steps by location.
-    std::vector<int> shifts(q.items.size(), 0);
     std::vector<int> tops(q.items.size(), -1);
     int low = r ? (r->low >= 0 ? r->low : std::max(0, r->classTop("sustain") - 36)) : -1;
     long long prevLoc = LLONG_MIN, curLoc = LLONG_MIN;
@@ -941,20 +942,54 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
         }
     }
 
-    for (size_t i = 0; i < q.items.size(); ++i) {
-        QItem& it = q.items[i];
-        if (it.isNote) emitNote(S, T, ti, it.note, shifts[i]);
-        else emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
-    }
-    q.items.clear();
-    q.hasNotes = false;
-    q.lastLoc = q.lastEnd = -1;
-    q.lastSlur = false;
 }
 
+// Sends everything queued for a track. Each voice is planned as a whole, but the engine
+// needs a track's events in time order (it rejects notes earlier than ones it already
+// has), so the voices are merged back into one time-ordered stream before sending.
 static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
 {
-    for (auto& v : ti.voices) flushVoice(S, T, ti, v.second);
+    struct Out {
+        long long t;
+        size_t seq;
+        VoiceQ* q;
+        size_t idx;
+        int shift;
+    };
+    std::vector<Out> outs;
+    std::map<VoiceQ*, std::vector<int> > plans;
+    size_t seq = 0;
+    for (auto& v : ti.voices) {
+        VoiceQ& q = v.second;
+        if (q.items.empty()) continue;
+        std::vector<int>& shifts = plans[&q];
+        planVoice(ti, q, shifts);
+        // Non-note items (articulation ranges) take the time of the next note in their voice.
+        long long nextT = LLONG_MIN, lastT = 0;
+        std::vector<long long> keys(q.items.size(), 0);
+        for (size_t i = q.items.size(); i-- > 0;) {
+            if (q.items[i].isNote) nextT = q.items[i].note.ev._location_us;
+            keys[i] = nextT;
+        }
+        for (size_t i = 0; i < q.items.size(); ++i) {
+            if (q.items[i].isNote) lastT = q.items[i].note.ev._location_us;
+            else if (keys[i] == LLONG_MIN) keys[i] = lastT;
+            outs.push_back(Out { keys[i], seq++, &q, i, shifts[i] });
+        }
+    }
+    std::stable_sort(outs.begin(), outs.end(), [](const Out& a, const Out& b) { return a.t < b.t; });
+    for (auto& o : outs) {
+        QItem& it = o.q->items[o.idx];
+        if (it.isNote) emitNote(S, T, ti, it.note, o.shift);
+        else emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
+    }
+    for (auto& v : ti.voices) {
+        VoiceQ& q = v.second;
+        q.items.clear();
+        q.hasNotes = false;
+        q.lastLoc = q.lastEnd = -1;
+        q.lastSlur = false;
+    }
 }
 
 // --- live / offline mixing ------------------------------------------------------
