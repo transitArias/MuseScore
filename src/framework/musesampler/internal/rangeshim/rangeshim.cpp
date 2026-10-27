@@ -563,6 +563,15 @@ static void renderShadow(Shadow& sh, int n, bool offline, long long pos, bool pl
     if (offline) R.ms_MuseSampler_process_offline(sh.h, b);
     else R.ms_MuseSampler_process(sh.h, b, pos);
     if (offline || playing) sh.untouchedSinceSet = false;
+    // One NaN/inf sample from the engine would poison the pitch shifter for ~100 ms (and
+    // MuseScore then silences the whole mix), so clean the shifter's input.
+    int bad = 0;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < n; ++i)
+            if (!std::isfinite(sh.in[c][i]) || std::fabs(sh.in[c][i]) > 32.0f) { sh.in[c][i] = 0.0f; ++bad; }
+    static std::atomic<int> logs { 0 };
+    if (bad && logs.fetch_add(1) < 200)
+        LOGI("bad audio from the engine in shadow %+d: %d sample(s) zeroed before shifting", sh.shift, bad);
 }
 
 // Shift sh.in -> (latency) -> extra delay -> optionally mix into dst.
@@ -1843,6 +1852,26 @@ EXPORT ms_Result ms_MuseSampler_stop_offline_mode(ms_MuseSampler ms)
     return r;
 }
 
+// A NaN/inf (or absurd) sample from any one instrument turns MuseScore's whole mix silent.
+// Zero such samples and log where they came from ("engine" = Muse Sounds itself,
+// "shift" = our shadow/pitch-shift mix), so the rest of the mix survives.
+static std::atomic<int> g_badLogs { 0 };
+static void sanitize(Sampler& S, ms_OutputBuffer& buf, const char* stage, double posSec)
+{
+    if (!buf._channels) return;
+    int bad = 0;
+    for (int c = 0; c < buf._num_channels; ++c) {
+        float* o = buf._channels[c];
+        if (!o) continue;
+        for (int i = 0; i < buf._num_data_pts; ++i) {
+            float x = o[i];
+            if (!std::isfinite(x) || std::fabs(x) > 32.0f) { o[i] = 0.0f; ++bad; }
+        }
+    }
+    if (bad && g_badLogs.fetch_add(1) < 200)
+        LOGI("bad audio from %s (sampler %p, %d shadow(s)) at %.3fs: %d sample(s) zeroed", stage, (void*)&S, (int)S.shadows.size(), posSec, bad);
+}
+
 EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuffer buf)
 {
     ensureReal();
@@ -1851,6 +1880,8 @@ EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuff
     Sampler* S = findS(ms);
     if (!S) return r;
     Guard g(S->cs);
+    const double offSec = S->offPos / (S->offSr > 0 ? S->offSr : 44100.0);
+    sanitize(*S, buf, "engine", offSec);
     try {
         for (auto& sp : S->shadows) {
             if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowOffline(*S, *sp.second, buf);
@@ -1858,6 +1889,7 @@ EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuff
     } catch (...) {
         LOGE("exception in offline shadow render");
     }
+    if (!S->shadows.empty()) sanitize(*S, buf, "shift", offSec);
     S->offPos += buf._num_data_pts;
     return r;
 }
@@ -1871,6 +1903,8 @@ EXPORT ms_Result ms_MuseSampler_process(ms_MuseSampler ms, ms_OutputBuffer buf, 
     if (!S) return r;
     Guard g(S->cs);
     S->pos = samples;
+    const double liveSec = samples / (S->sr > 0 ? S->sr : 48000.0);
+    sanitize(*S, buf, "engine", liveSec);
     try {
         for (auto& sp : S->shadows) {
             if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowLive(*S, *sp.second, buf, samples);
@@ -1878,6 +1912,7 @@ EXPORT ms_Result ms_MuseSampler_process(ms_MuseSampler ms, ms_OutputBuffer buf, 
     } catch (...) {
         LOGE("exception in shadow render");
     }
+    if (!S->shadows.empty()) sanitize(*S, buf, "shift", liveSec);
     return r;
 }
 
