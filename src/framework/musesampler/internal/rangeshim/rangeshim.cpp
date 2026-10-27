@@ -164,6 +164,8 @@ struct Config {
     long long runGapUs = 30000;    // notes this close count as one continuous run
     long long fastNoteUs = 160000; // notes this short can join a shifted run
     long long runJoinUs = 300000;  // ...if they are within this distance of an out-of-range note
+    bool trillOctave = false;      // optional: shifted trills are played a whole octave down
+    long long trillNoteUs = 80000; // shifted notes this short with the trill mark = a written-out trill
 };
 
 static Config g_cfg;
@@ -212,6 +214,8 @@ static void loadConfigAndRanges()
     g_cfg.runGapUs = 1000 * std::max<long long>(0, cfg.geti("general", "run_gap_ms", 30));
     g_cfg.fastNoteUs = 1000 * std::max<long long>(0, cfg.geti("general", "fast_note_ms", 160));
     g_cfg.runJoinUs = 1000 * std::max<long long>(0, cfg.geti("general", "run_join_ms", 300));
+    g_cfg.trillOctave = cfg.geti("general", "trill_octave", 0) != 0;
+    g_cfg.trillNoteUs = 1000 * std::max<long long>(0, cfg.geti("general", "trill_note_ms", 80));
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -461,6 +465,8 @@ struct Shadow {
     bool gaveUp = false;    // timed out once: never block playback on it again
     std::vector<float> in[2], out[2], dl[2];
     size_t dlPos = 0;
+    double teleIn = 0, teleOut = 0; // sum of squares since last report
+    long long teleN = 0;
 };
 
 struct Sampler {
@@ -572,6 +578,13 @@ static void runFx(Shadow& sh, int n, ms_OutputBuffer* dst)
             if (++p == (size_t)sh.d) p = 0;
         }
         sh.dlPos = p;
+    }
+    if (g_logLevel >= 2) {
+        for (int i = 0; i < n; ++i) {
+            sh.teleIn += (double)sh.in[0][i] * sh.in[0][i];
+            sh.teleOut += (double)sh.out[0][i] * sh.out[0][i];
+        }
+        sh.teleN += n;
     }
     if (dst && dst->_channels) {
         int nc = std::min(dst->_num_channels, 2);
@@ -712,11 +725,11 @@ static const InstRange* rangeFor(TrackInfo& ti)
 // --- routing ------------------------------------------------------------------
 
 // Shift (in semitones, signed) needed for a single note, 0 if none / impossible.
-static int shiftFor(int pitch, int top, int low)
+static int shiftFor(int pitch, int top, int low, bool trill = false)
 {
     if (top < 0) return 0;
     if (pitch > top) {
-        int s = g_cfg.octaveMode ? 12 * ((pitch - top + 11) / 12) : pitch - top;
+        int s = (g_cfg.octaveMode || (trill && g_cfg.trillOctave)) ? 12 * ((pitch - top + 11) / 12) : pitch - top;
         if (s > g_cfg.maxShiftUp) return 0;
         if (low >= 0 && pitch - s < low) return 0;
         return s;
@@ -750,12 +763,18 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int shif
     }
     ms_NoteEvent_5 ev = n.ev;
     ev._pitch -= shift;
+    // MuseScore sends trills it can't hand to Muse Sounds natively as tiny written-out notes
+    // that still carry the trill mark; Muse Sounds plays nothing for those, so send them plain.
+    if (shift != 0 && (ev._articulation & ms_NoteArticulation_Trill) && ev._duration_us <= g_cfg.trillNoteUs) {
+        ev._articulation = (ms_NoteArticulation)((uint64_t)ev._articulation & ~(uint64_t)ms_NoteArticulation_Trill);
+    }
     if (R.ms_MuseSampler_add_track_note_event_6(dstS, dstT, ev, realId) != ms_Result_OK) {
         LOGD("add note failed (pitch %d, shift %d)", n.ev._pitch, shift);
     }
     if (shift != 0) {
-        LOGD("note %s @%lldus -> shadow %+d (plays %s)", noteName(n.ev._pitch).c_str(), n.ev._location_us, shift,
-             noteName(ev._pitch).c_str());
+        LOGD("note %s @%lldus -> shadow %+d (plays %s) dur %lldms art 0x%llx/0x%llx", noteName(n.ev._pitch).c_str(),
+             n.ev._location_us, shift, noteName(ev._pitch).c_str(), ev._duration_us / 1000,
+             (unsigned long long)n.ev._articulation, (unsigned long long)n.ev._articulation_2);
     }
     IdRoute& route = ti.ids[n.id];
     route.shift = shift;
@@ -824,7 +843,7 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
         curStepSlur = curStepSlur || slur;
         int ctx = slur ? Legato_Slurred : (prevLoc != LLONG_MIN && prevStepSlur ? Legato_Target : Legato_None);
         tops[i] = r ? r->noteTop(ev._articulation, it.note.textArt, ctx) : -1;
-        shifts[i] = shiftFor(ev._pitch, tops[i], low);
+        shifts[i] = shiftFor(ev._pitch, tops[i], low, (ev._articulation & ms_NoteArticulation_Trill) != 0);
         if (shifts[i] != 0) any = true;
     }
 
@@ -892,6 +911,16 @@ static void flushVoice(Sampler& S, ms_Track T, TrackInfo& ti, VoiceQ& q)
                             const ms_NoteEvent_5& ev = q.items[i].note.ev;
                             outSpans.push_back(std::make_pair(ev._location_us, ev._location_us + ev._duration_us));
                         }
+                bool trillRun = false;
+                for (size_t k = a0; k <= b0 && !trillRun; ++k)
+                    for (size_t i : steps[k].idx)
+                        if (shifts[i] != 0 && (q.items[i].note.ev._articulation & ms_NoteArticulation_Trill)) trillRun = true;
+                if (runShift != 0 && trillRun && g_cfg.trillOctave && std::abs(runShift) % 12 != 0) {
+                    // Trills at the very top of the range come out silent; play them an octave down.
+                    int oct = 12 * ((std::abs(runShift) + 11) / 12);
+                    runShift = runShift > 0 ? oct : -oct;
+                    LOGD("trill run at %lldus: using %+d", steps[a0].loc, runShift);
+                }
                 if (runShift != 0) {
                     for (size_t k = a0; k <= b0; ++k)
                         for (size_t i : steps[k].idx) {
@@ -945,6 +974,18 @@ static bool shadowWanted(Sampler& S, Shadow& sh, int n)
     return false;
 }
 
+static void teleReport(Sampler& S, Shadow& sh, long long pos)
+{
+    double sr = S.offline && S.offSr > 0 ? S.offSr : (S.sr > 0 ? S.sr : 48000);
+    if (g_logLevel < 2 || sh.teleN < (long long)sr) return;
+    double ri = std::sqrt(sh.teleIn / sh.teleN), ro = std::sqrt(sh.teleOut / sh.teleN);
+    auto db = [](double r) { return r > 1e-9 ? 20.0 * std::log10(r) : -180.0; };
+    if (S.playing || S.offline)
+        LOGD("level shadow %+d at %.1fs: engine %.0f dB, after shift %.0f dB", sh.shift, pos / sr, db(ri), db(ro));
+    sh.teleIn = sh.teleOut = 0;
+    sh.teleN = 0;
+}
+
 static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long long pos)
 {
     int n = out._num_data_pts;
@@ -967,6 +1008,7 @@ static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long lon
     }
     renderShadow(sh, n, false, pos + sh.la, S.playing);
     runFx(sh, n, &out);
+    if (sh.notes > 0) teleReport(S, sh, pos);
     sh.expectedPos = S.playing ? pos + n : pos;
 }
 
@@ -987,6 +1029,7 @@ static void mixShadowOffline(Sampler& S, Shadow& sh, ms_OutputBuffer& out)
     }
     renderShadow(sh, n, true, 0);
     runFx(sh, n, &out);
+    if (sh.notes > 0) teleReport(S, sh, S.offPos);
 }
 
 // ---------------------------------------------------------------------------
