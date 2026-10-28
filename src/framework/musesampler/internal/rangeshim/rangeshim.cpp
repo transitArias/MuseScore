@@ -176,6 +176,7 @@ struct Config {
     int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
     bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
     float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
+    bool tremoloMerge = true;      // tremolo instances get one long note per tremolo, not its 32nd repetitions
     bool refinalize = true;        // re-finalize an instance's other tracks after a track is added to it
     int tremoloDynSteps = -1;      // tremolo notes get the score's dynamic this many markings softer (0 = off)
     // Diagnostics: for instruments whose "pack|name" contains debugInst, log what every instance was sent
@@ -240,6 +241,7 @@ static void loadConfigAndRanges()
     g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
     g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
+    g_cfg.tremoloMerge = cfg.geti("general", "tremolo_merge", 1) != 0;
     g_cfg.refinalize = cfg.geti("general", "refinalize_instances", 1) != 0;
     g_cfg.tremoloDynSteps = (int)std::max<long long>(-4, std::min<long long>(2, cfg.geti("general", "tremolo_dynamic_steps", -1)));
     g_cfg.debugInst = lower(cfg.get("general", "debug_instrument", ""));
@@ -279,7 +281,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d refinalize_instances=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps, (int)g_cfg.refinalize);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d refinalize_instances=%d tremolo_merge=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps, (int)g_cfg.refinalize, (int)g_cfg.tremoloMerge);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -457,6 +459,7 @@ struct QItem {
     int voice = 0;
     uint64_t art = 0;
     bool drop = false; // range item made obsolete by trill_written_out
+    long long mergedInto = -1; // tremolo_merge: this repetition is part of the note at that index
 };
 
 struct VoiceQ {
@@ -1476,6 +1479,44 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
                 else tgt[i] = keep;
             }
         }
+        // tremolo_merge: MuseScore sends a tremolo as its written repetitions (a r32 half = 12 notes of
+        // 83 ms, each marked tremolo). Muse Sounds plays those one by one - with two notes it rocks
+        // between them (the notorious 'alternating' chord tremolo), with one note it is a ratchet
+        // (Strudwick I:75 Vn I). On a tremolo instance every chord note is alone, so hand it what a
+        // player reads: one held note per tremolo with the tremolo mark. Two-chord tremolos (pitches
+        // alternate) are left as written. The range start/end around each tremolo stays as is.
+        if (g_cfg.tremoloMerge) {
+            const uint64_t TREM = (uint64_t)(ms_NoteArticulation_Tremolo1 | ms_NoteArticulation_Tremolo2
+                                             | ms_NoteArticulation_Tremolo3 | ms_NoteArticulation_BuzzTremolo);
+            std::map<std::pair<int, int>, size_t> head; // (instance, pitch) -> note being extended
+            int merged = 0;
+            for (size_t i = 0; i < q.items.size(); ++i) {
+                QItem& it = q.items[i];
+                if (!it.isNote) {
+                    if (it.drop) continue;
+                    for (int k : tgt[i]) // a range marker on an instance closes what was being extended there
+                        for (auto h = head.begin(); h != head.end();) h = h->first.first == k ? head.erase(h) : std::next(h);
+                    continue;
+                }
+                const int key = shifts[i];
+                if (!isTremoloLane(keyLane(key)) || !((uint64_t)it.note.ev._articulation & TREM)) continue;
+                const auto hk = std::make_pair(key, it.note.ev._pitch);
+                auto h = head.find(hk);
+                if (h != head.end()) {
+                    ms_NoteEvent_5& hv = q.items[h->second].note.ev;
+                    const long long hend = hv._location_us + hv._duration_us;
+                    if (it.note.ev._location_us >= hv._location_us && std::llabs(it.note.ev._location_us - hend) <= 20000
+                        && ((uint64_t)hv._articulation & TREM) == ((uint64_t)it.note.ev._articulation & TREM)) {
+                        hv._duration_us = it.note.ev._location_us + it.note.ev._duration_us - hv._location_us;
+                        it.mergedInto = (long long)h->second;
+                        ++merged;
+                        continue;
+                    }
+                }
+                head[hk] = i;
+            }
+            if (merged) LOGD("instrument %d: %d tremolo repetition(s) merged into held notes", ti.instId, merged);
+        }
         // Non-note items (articulation ranges) take the time of the next note in their voice.
         long long nextT = LLONG_MIN, lastT = 0;
         std::vector<long long> keys(q.items.size(), 0);
@@ -1492,7 +1533,12 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     std::stable_sort(outs.begin(), outs.end(), [](const Out& a, const Out& b) { return a.t < b.t; });
     for (auto& o : outs) {
         QItem& it = o.q->items[o.idx];
-        if (it.isNote) emitNote(S, T, ti, it.note, o.shift, laneGains[o.q][o.idx]);
+        if (it.isNote && it.mergedInto >= 0) {
+            // part of an earlier held note: route its id there (for pitch bends / vibrato)
+            const QItem& hd = o.q->items[(size_t)it.mergedInto];
+            auto hr = ti.ids.find(hd.note.id);
+            if (hr != ti.ids.end()) ti.ids[it.note.id] = hr->second;
+        } else if (it.isNote) emitNote(S, T, ti, it.note, o.shift, laneGains[o.q][o.idx]);
         else if (!it.drop) {
             const std::set<int>& targets = rangeTargets[o.q][o.idx];
             emitRangeTo(S, T, ti, it.rangeStart, it.voice, it.art, targets);
