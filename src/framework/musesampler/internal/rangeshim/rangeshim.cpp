@@ -176,6 +176,7 @@ struct Config {
     int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
     bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
     float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
+    bool refinalize = true;        // re-finalize an instance's other tracks after a track is added to it
     int tremoloDynSteps = -1;      // tremolo notes get the score's dynamic this many markings softer (0 = off)
     // Diagnostics: for instruments whose "pack|name" contains debugInst, log what every instance was sent
     // between debugFromUs and debugToUs (notes and dynamics), when the score is loaded.
@@ -239,6 +240,7 @@ static void loadConfigAndRanges()
     g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
     g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
+    g_cfg.refinalize = cfg.geti("general", "refinalize_instances", 1) != 0;
     g_cfg.tremoloDynSteps = (int)std::max<long long>(-4, std::min<long long>(2, cfg.geti("general", "tremolo_dynamic_steps", -1)));
     g_cfg.debugInst = lower(cfg.get("general", "debug_instrument", ""));
     g_cfg.debugFromUs = (long long)(cfg.getd("general", "debug_from_s", -1.0) * 1e6);
@@ -277,7 +279,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d refinalize_instances=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps, (int)g_cfg.refinalize);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -528,6 +530,7 @@ struct Shadow {
     long long lastSetPos = LLONG_MIN;
     long long expectedPos = LLONG_MIN;
     int notes = 0;
+    int tracks = 0; // mirror tracks added to this instance
     int auditions = 0;
     long long idleSamples = 0;
     ULONGLONG createdTick = 0;
@@ -826,6 +829,7 @@ static MirrorTrack* ensureMirror(Sampler& S, TrackInfo& ti, int shift)
     }
     MirrorTrack& m = ti.mirrors[shift];
     m.t = t;
+    sh->tracks++;
     for (const auto& e : ti.log) replayEntry(e, sh->h, m, sh->lane);
     LOGD("mirror track for instrument %d at %+d, replayed %d events", ti.instId, shift, (int)ti.log.size());
     return &m;
@@ -1907,10 +1911,30 @@ EXPORT ms_Result ms_MuseSampler_finalize_track(ms_MuseSampler ms, ms_Track t)
         Guard g(S->cs);
         TrackInfo* ti = trackInfo(*S, t);
         if (ti) {
+            std::map<int, int> tracksBefore;
+            for (auto& sp : S->shadows) tracksBefore[sp.first] = sp.second->tracks;
             try {
                 flushTrack(*S, t, *ti);
             } catch (...) {
                 LOGE("exception while flushing notes");
+            }
+            // An instance that gets a new track after other tracks on it were finalized: finalize those
+            // again (in MuseScore's own instances every track exists before the first finalize; the
+            // engine seems to drop the earlier tracks' dynamics otherwise - Strudwick I:13 basses).
+            if (g_cfg.refinalize) {
+                for (auto& sp : S->shadows) {
+                    auto bt = tracksBefore.find(sp.first);
+                    if (bt == tracksBefore.end() || bt->second <= 0 || sp.second->tracks <= bt->second) continue;
+                    int again = 0;
+                    for (auto& tp : S->tracks) {
+                        if (&tp.second == ti) continue;
+                        auto mit = tp.second.mirrors.find(sp.first);
+                        if (mit == tp.second.mirrors.end()) continue;
+                        R.ms_MuseSampler_finalize_track(sp.second->h, mit->second.t);
+                        ++again;
+                    }
+                    if (again) LOGI("instance shift %+d lane %d got a new track: finalized its %d other track(s) again", keyShift(sp.first), keyLane(sp.first), again);
+                }
             }
             for (auto& mp : ti->mirrors) {
                 auto sit = S->shadows.find(mp.first);
