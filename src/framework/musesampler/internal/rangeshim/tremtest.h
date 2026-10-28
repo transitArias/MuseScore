@@ -231,6 +231,44 @@ static std::vector<TCase> buildCases()
             }
         }
     }
+    // Strudwick I:75-77 [E] Vn I as the lanes get it: six r32 half-note tremolos per lane, a range per bar,
+    // sul pont., p. The user found that with the first chord reduced to one note the rest played right,
+    // so also: the same lanes starting at bar 2, and the stock chords.
+    {
+        int id = findInstrument("muse strings|violins 1");
+        if (id < 0 && envPath(L"MSR_TREMTEST_ANY") == L"1") id = 1;
+        if (id >= 0) {
+            const int top[6] = { 66, 64, 64, 62, 64, 64 }, bot[6] = { 57, 56, 55, 57, 56, 55 };
+            for (int tech = 0; tech < 2; ++tech) {
+                const uint64_t base = tech ? SP : 0;
+                auto lane = [&](const char* nm, const int* ps, int from, bool chord) {
+                    TCase c;
+                    c.name = std::string("E_") + (tech ? "sulpont_" : "ord_") + nm;
+                    c.inst = id;
+                    c.dyn = 16 / 127.0;
+                    c.rangeArt = T3;
+                    c.p1 = ps[from];
+                    c.p2 = chord ? top[from] : 0;
+                    c.winA = START + from * STEPS * STEP + 150000;
+                    c.winB = START + 6 * STEPS * STEP - 50000;
+                    for (int b = from; b < 6; ++b)
+                        for (int k = 0; k < STEPS; ++k)
+                            for (int pi = 0; pi < (chord ? 2 : 1); ++pi) {
+                                TNote n { START + (b * STEPS + k) * STEP, STEP, chord ? (pi ? top[b] : bot[b]) : ps[b], base | T3 };
+                                if (k == 0) n.rangeOpen = 1;
+                                if (k == STEPS - 1) n.rangeClose = 1;
+                                c.notes.push_back(n);
+                            }
+                    cases.push_back(c);
+                };
+                lane("lane_top", top, 0, false);
+                lane("lane_bottom", bot, 0, false);
+                lane("lane_top_from_bar2", top, 1, false);
+                lane("lane_bottom_from_bar2", bot, 1, false);
+                lane("stock_chords", bot, 0, true);
+            }
+        }
+    }
     return cases;
 }
 
