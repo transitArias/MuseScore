@@ -1711,6 +1711,11 @@ EXPORT void ms_MuseSampler_destroy(ms_MuseSampler ms)
 static ms_Result initCommon(ms_MuseSampler ms, double sr, int block, int ch, bool legacy)
 {
     ensureReal();
+#ifdef MSR_EXTDLL
+    // ms_init itself is not intercepted in the DLL (see msr_wrap_builtin): note it here, once.
+    static INIT_ONCE s_noted = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&s_noted, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL { noteInit(ms_Result_OK); return TRUE; }, nullptr, nullptr);
+#endif
     ms_Result r = legacy ? R.ms_MuseSampler_init(ms, sr, block, ch) : R.ms_MuseSampler_init_2(ms, sr, block, ch);
     if (r != ms_Result_OK || !g_cfg.enabled) return r;
     Sampler* S = getOrCreateS(ms);
@@ -2492,6 +2497,12 @@ static void* msr_wrap_builtin(const char* name, void* real)
 #undef MSR_SETR
     ensureReal();
     if (!g_cfg.enabled) return real;
+#ifdef MSR_EXTDLL
+    // Muse Sounds refuses to initialise when ms_init/ms_init_2 is called from anywhere but MuseScore's own
+    // code (2026-10-28: "init-failed" with these wrapped in the DLL). Let MuseScore call them directly; the
+    // DLL does its start-up work (status, calibration) when the first sampler is initialised instead.
+    if (std::strcmp(name, "ms_init") == 0 || std::strcmp(name, "ms_init_2") == 0) return real;
+#endif
 #define MSR_WRAP(n) if (std::strcmp(name, #n) == 0) return (void*)&n;
     MSR_INTERCEPTED(MSR_WRAP)
 #undef MSR_WRAP
