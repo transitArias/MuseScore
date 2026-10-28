@@ -26,6 +26,7 @@ extern "C" void* msr_wrap(const char*, void* real) { return real; }
 #include "common.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
 #include "probe_core.h"
+#include "tremtest.h"
 
 using namespace msr;
 
@@ -1798,11 +1799,48 @@ static void calibrateIfRequested()
     }
 }
 
+// config [general] tremolo_test=1: render the tremolo test bench once (tremtest.h), then carry on.
+static void tremTestIfRequested()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    Ini cfg;
+    cfg.load(g_dir + L"\\config.ini");
+    if (cfg.geti("general", "tremolo_test", 0) != 1) return;
+    if (GetFileAttributesW((g_dir + L"\\tremtest_out\\complete.txt").c_str()) != INVALID_FILE_ATTRIBUTES) return;
+#define COPYF(n) A.n = R.n;
+    PROBE_FUNCS(COPYF)
+#undef COPYF
+    std::string missing;
+#define NEEDF(n) if (!A.n) missing += std::string(" ") + #n;
+    NEEDF(ms_get_instrument_list) NEEDF(ms_InstrumentList_get_next) NEEDF(ms_Instrument_get_id) NEEDF(ms_Instrument_get_name)
+    NEEDF(ms_Instrument_get_pack_name) NEEDF(ms_MuseSampler_create) NEEDF(ms_MuseSampler_destroy) NEEDF(ms_MuseSampler_init_2)
+    NEEDF(ms_MuseSampler_add_track) NEEDF(ms_MuseSampler_finalize_track) NEEDF(ms_MuseSampler_add_track_note_event_6)
+    NEEDF(ms_MuseSampler_add_track_dynamics_event_2) NEEDF(ms_MuseSampler_start_offline_mode) NEEDF(ms_MuseSampler_stop_offline_mode)
+    NEEDF(ms_MuseSampler_process_offline) NEEDF(ms_MuseSampler_set_position) NEEDF(ms_MuseSampler_set_playing)
+    NEEDF(ms_MuseSampler_ready_to_play) NEEDF(ms_MuseSampler_add_track_event_range_start) NEEDF(ms_MuseSampler_add_track_event_range_end)
+#undef NEEDF
+    if (!missing.empty()) {
+        LOGE("tremolo test skipped, engine functions not available yet:%s", missing.c_str());
+        return;
+    }
+    LOGE("STATUS tremolo-test");
+    writeStatus("tremolo-test");
+    try {
+        tremtest::run(g_dir, progressSink);
+    } catch (...) {
+        LOGE("exception in the tremolo test");
+    }
+    LOGE("tremolo test finished");
+}
+
 // MuseScore only calls init after its own API compatibility check has passed,
 // so this marks the shim as accepted (launch.cmd watches for it).
 static ms_Result noteInit(ms_Result r)
 {
     if (r == ms_Result_OK) calibrateIfRequested();
+    if (r == ms_Result_OK) tremTestIfRequested();
     LOGE("STATUS %s", r == ms_Result_OK ? "accepted" : "init-failed");
     writeStatus(r == ms_Result_OK ? "accepted" : "init-failed");
     return r;
