@@ -182,6 +182,7 @@ static Config g_cfg;
 static std::wstring g_dir;
 static std::map<std::string, InstRange> g_rangesByKey; // lower-case "pack|name"
 static std::map<std::string, double> g_muteGainByKey; // "pack|name" -> linear gain while muted (con sord.)
+static std::map<std::string, int> g_trillCentsByKey;  // "pack|name" -> pitch correction for trill notes (cents)
 static std::map<int, InstRange> g_rangesById;
 static std::string g_rangesLibVersion;
 static std::string g_engineVer;
@@ -251,6 +252,11 @@ static void loadConfigAndRanges()
         if (s == "general" || s.empty()) continue;
         InstRange& r = g_rangesByKey[s];
         applyRangeSection(r, cfg.sec[s]);
+        int tc = (int)cfg.geti(s, "trill_cents", 0);
+        if (tc != 0) {
+            g_trillCentsByKey[lower(s)] = std::max(-100, std::min(100, tc));
+            LOGI("config: %s trill notes %+d cents", s.c_str(), tc);
+        }
         double gdb = cfg.getd(s, "con_sord_gain_db", 0.0);
         if (gdb != 0.0) {
             g_muteGainByKey[lower(s)] = std::pow(10.0, std::max(-40.0, std::min(24.0, gdb)) / 20.0);
@@ -279,7 +285,11 @@ static BOOL CALLBACK initOnceFn(PINIT_ONCE, PVOID, PVOID*)
     g_statusPath = g_dir + L"\\shim_status.txt";
     writeStatus("loaded");
     LOGE("STATUS loaded");
+#ifdef MSR_EXTDLL
+    LOGI("MuseRangeShim external DLL (ext\\MuseRangeShim.dll, build %s); folder %s", MSR_EXT_BUILD, narrow(g_dir).c_str());
+#else
     LOGI("MuseRangeShim built into MuseScore (in-tree mode); folder %s", narrow(g_dir).c_str());
+#endif
     loadConfigAndRanges();
     return TRUE;
 #endif
@@ -468,6 +478,8 @@ struct TrackInfo {
     std::map<int, VoiceQ> voices;
     std::unordered_map<long long, IdRoute> ids;
     std::map<int, MirrorTrack> mirrors; // shift -> mirror track in that shadow
+    bool trillCentsResolved = false;
+    int trillCents = 0;
     bool muteResolved = false;
     double muteGain = 1.0;                                // con_sord_gain_db for this instrument
     std::vector<std::pair<long long, bool> > muteSpans;   // (time, muted from here on), sorted
@@ -809,6 +821,21 @@ static double muteGainFor(TrackInfo& ti)
     return ti.muteGain;
 }
 
+static int trillCentsFor(TrackInfo& ti)
+{
+    if (!ti.trillCentsResolved && ti.instId >= 0) {
+        ti.trillCentsResolved = true;
+        rangeFor(ti);
+        Guard g(g_instCs);
+        auto it = g_instKeyById.find(ti.instId);
+        if (it != g_instKeyById.end()) {
+            auto ct = g_trillCentsByKey.find(lower(it->second));
+            if (ct != g_trillCentsByKey.end()) ti.trillCents = ct->second;
+        }
+    }
+    return ti.trillCents;
+}
+
 static bool isMuteText(const std::string& text)
 {
     std::string t = lower(text);
@@ -902,6 +929,10 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
     const int shift = keyShift(key);
     ms_NoteEvent_5 ev = n.ev;
     ev._pitch -= shift;
+    if (ev._articulation & ms_NoteArticulation_Trill) {
+        int tc = trillCentsFor(ti);
+        if (tc) ev._offset_cents = std::max(-100, std::min(100, ev._offset_cents + tc));
+    }
     // MuseScore sends trills it can't hand to Muse Sounds natively as tiny written-out notes
     // that still carry the trill mark; Muse Sounds plays nothing for those, so send them plain.
     if (shift != 0 && (ev._articulation & ms_NoteArticulation_Trill) && ev._duration_us <= g_cfg.trillNoteUs) {
@@ -2386,7 +2417,42 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
     X(ms_MuseSampler_start_offline_mode) X(ms_MuseSampler_stop_offline_mode) X(ms_MuseSampler_process_offline) \
     X(ms_MuseSampler_process) X(ms_MuseSampler_ready_to_play)
 
+// The extension can also live in a separate DLL (same source, built with -DMSR_EXTDLL), so it
+// can be rebuilt and swapped without rebuilding MuseScore: if <MSR_DIR>\ext\MuseRangeShim.dll
+// exists and exports msr_wrap_ext, every lookup goes there instead of the built-in copy below.
+static void* msr_wrap_builtin(const char* name, void* real);
+
+#ifdef MSR_EXTDLL
+extern "C" __declspec(dllexport) void* msr_wrap_ext(const char* name, void* real)
+{
+    return msr_wrap_builtin(name, real);
+}
+extern "C" __declspec(dllexport) const char* msr_ext_build()
+{
+    return MSR_EXT_BUILD;
+}
+#else
+typedef void* (*msr_wrap_fn)(const char*, void*);
+static msr_wrap_fn loadExternalShim()
+{
+    std::wstring dir = envPath(L"MSR_DIR");
+    if (dir.empty()) dir = envPath(L"LOCALAPPDATA") + L"\\MuseRangeShim";
+    std::wstring path = dir + L"\\ext\\MuseRangeShim.dll";
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return nullptr;
+    HMODULE h = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!h) return nullptr;
+    return (msr_wrap_fn)(void*)GetProcAddress(h, "msr_wrap_ext");
+}
+
 extern "C" void* msr_wrap(const char* name, void* real)
+{
+    static msr_wrap_fn ext = loadExternalShim(); // thread-safe one-time init
+    if (ext) return ext(name, real);
+    return msr_wrap_builtin(name, real);
+}
+#endif
+
+static void* msr_wrap_builtin(const char* name, void* real)
 {
     if (!name || !real) return real;
 #define MSR_SETR(n) if (std::strcmp(name, #n) == 0) R.n = (n##_t)real;
