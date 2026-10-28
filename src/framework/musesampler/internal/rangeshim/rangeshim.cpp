@@ -177,6 +177,10 @@ struct Config {
     bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
     float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
     int tremoloDynSteps = -1;      // tremolo notes get the score's dynamic this many markings softer (0 = off)
+    // Diagnostics: for instruments whose "pack|name" contains debugInst, log what every instance was sent
+    // between debugFromUs and debugToUs (notes and dynamics), when the score is loaded.
+    std::string debugInst;
+    long long debugFromUs = -1, debugToUs = -1;
 };
 
 static Config g_cfg;
@@ -236,6 +240,11 @@ static void loadConfigAndRanges()
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
     g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
     g_cfg.tremoloDynSteps = (int)std::max<long long>(-4, std::min<long long>(2, cfg.geti("general", "tremolo_dynamic_steps", -1)));
+    g_cfg.debugInst = lower(cfg.get("general", "debug_instrument", ""));
+    g_cfg.debugFromUs = (long long)(cfg.getd("general", "debug_from_s", -1.0) * 1e6);
+    g_cfg.debugToUs = (long long)(cfg.getd("general", "debug_to_s", -1.0) * 1e6);
+    if (!g_cfg.debugInst.empty())
+        LOGI("config: DEBUG report for instruments matching \"%s\" from %.2fs to %.2fs", g_cfg.debugInst.c_str(), g_cfg.debugFromUs / 1e6, g_cfg.debugToUs / 1e6);
     g_cfg.tremoloGain = (float)std::pow(10.0, std::max(-40.0, std::min(12.0, cfg.getd("general", "tremolo_chord_gain_db", 0.0))) / 20.0);
 
     Ini rng;
@@ -1336,6 +1345,38 @@ static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes,
     return split;
 }
 
+static std::string instName(int instId);
+static std::string artNames(uint64_t a1, uint64_t a2);
+
+// debug_instrument / debug_from_s / debug_to_s: what each instance of this track was sent in the window.
+static void debugReport(Sampler& S, ms_Track T, TrackInfo& ti)
+{
+    if (g_cfg.debugInst.empty() || g_cfg.debugToUs <= g_cfg.debugFromUs) return;
+    const std::string name = instName(ti.instId);
+    if (lower(name).find(g_cfg.debugInst) == std::string::npos) return;
+    const long long a = g_cfg.debugFromUs, b = g_cfg.debugToUs;
+    LOGI("DEBUG %s, sampler %p, track %p: %d notes sent in total, %d log entries; mirrors:", name.c_str(), (void*)S.s, (void*)T,
+         (int)ti.sent.size(), (int)ti.log.size());
+    for (auto& mp : ti.mirrors) LOGI("DEBUG   instance key %d = shift %+d lane %d (mirror track %p)", mp.first, keyShift(mp.first), keyLane(mp.first), (void*)mp.second.t);
+    for (const auto& e : ti.log) {
+        if (e.kind != LogEntry::Dyn || e.t < a - 2000000 || e.t > b) continue;
+        LOGI("DEBUG   dynamics %.3fs = %.4f (tremolo instances get %.4f)", e.t / 1e6, e.v, shiftDynamicMarkings(e.v, g_cfg.tremoloDynSteps));
+    }
+    for (const auto& e : ti.log) {
+        if (e.kind == LogEntry::Dyn || e.kind == LogEntry::Pedal) continue;
+        if ((e.kind == LogEntry::Text || e.kind == LogEntry::PresetCreate || e.kind == LogEntry::Syll) && (e.t < a - 2000000 || e.t > b)) continue;
+        static const char* K[] = { "dyn", "pedal", "text", "preset-create", "preset-add", "syllable", "range-start", "range-end" };
+        if (e.kind == LogEntry::RangeStart || e.kind == LogEntry::RangeEnd) continue; // no times; too many
+        LOGI("DEBUG   %s %.3fs %s", K[e.kind], e.t / 1e6, e.s.c_str());
+    }
+    for (const auto& n : ti.sent) {
+        if (n.loc + n.dur < a || n.loc > b) continue;
+        LOGI("DEBUG   note %s @%.3fs dur %lldms voice %d %s -> %s%s", noteName(n.pitch).c_str(), n.loc / 1e6, n.dur / 1000, n.voice,
+             artNames(n.a1, n.a2).c_str(), n.key ? ("instance shift " + std::to_string(keyShift(n.key)) + " lane " + std::to_string(keyLane(n.key))).c_str() : "main",
+             n.ok ? "" : " (REJECTED)");
+    }
+}
+
 // Sends everything queued for a track. Each voice is planned as a whole, but the engine
 // needs a track's events in time order (it rejects notes earlier than ones it already
 // has), so the voices are merged back into one time-ordered stream before sending.
@@ -1384,6 +1425,7 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     if (tremoloSplit)
         LOGI("instrument %d: %d tremolo chord note(s) played on their own instance (one-note tremolo per chord note, balanced %d)",
              ti.instId, tremoloSplit, (int)g_cfg.tremoloBalance);
+    debugReport(S, T, ti);
     for (auto& v : ti.voices) {
         VoiceQ& q = v.second;
         q.items.clear();
