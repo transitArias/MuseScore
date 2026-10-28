@@ -176,6 +176,7 @@ struct Config {
     int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
     bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
     float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
+    int tremoloDynSteps = -1;      // tremolo notes get the score's dynamic this many markings softer (0 = off)
 };
 
 static Config g_cfg;
@@ -234,6 +235,7 @@ static void loadConfigAndRanges()
     g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
     g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
+    g_cfg.tremoloDynSteps = (int)std::max<long long>(-4, std::min<long long>(2, cfg.geti("general", "tremolo_dynamic_steps", -1)));
     g_cfg.tremoloGain = (float)std::pow(10.0, std::max(-40.0, std::min(12.0, cfg.getd("general", "tremolo_chord_gain_db", 0.0))) / 20.0);
 
     Ini rng;
@@ -266,7 +268,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -722,12 +724,36 @@ static Shadow* ensureShadow(Sampler& S, int key)
     return raw;
 }
 
-static void replayEntry(const LogEntry& e, ms_MuseSampler h, MirrorTrack& m)
+// Lanes 1..49 play only tremolo notes (see assignTremoloLanes): 1.. = chord ranks, 40 = unsplit tremolos.
+static inline bool isTremoloLane(int lane) { return lane >= 1 && lane < 50; }
+static const int SINGLE_TREMOLO_LANE = 40; // unsplit tremolos (own gain 1), never shares a lane with chord ranks
+
+// The engine's dynamics values for MuseScore's markings (MuseSamplerSequencer::dynamicLevelRatio):
+// ppppp pppp ppp pp p mp mf f ff fff. Shifts a value by `steps` markings, interpolating in between.
+static double shiftDynamicMarkings(double v, int steps)
+{
+    static const double P[] = { 0.0, 1 / 127.0, 2 / 127.0, 4 / 127.0, 8 / 127.0, 16 / 127.0, 32 / 127.0, 64 / 127.0,
+                                96 / 127.0, 120 / 127.0, 127 / 127.0 };
+    const int N = (int)(sizeof(P) / sizeof(P[0]));
+    if (steps == 0) return v;
+    double x = N - 1;
+    for (int i = 0; i + 1 < N; ++i) {
+        if (v <= P[i + 1]) { x = i + (P[i + 1] > P[i] ? (v - P[i]) / (P[i + 1] - P[i]) : 0.0); break; }
+    }
+    x = std::max(0.0, std::min((double)(N - 1), x + steps));
+    int i = std::min(N - 2, (int)x);
+    return P[i] + (P[i + 1] - P[i]) * (x - i);
+}
+
+static void replayEntry(const LogEntry& e, ms_MuseSampler h, MirrorTrack& m, int lane = 0)
 {
     switch (e.kind) {
-    case LogEntry::Dyn:
-        R.ms_MuseSampler_add_track_dynamics_event_2(h, m.t, ms_DynamicsEvent_2 { e.t, e.v });
+    case LogEntry::Dyn: {
+        double v = e.v;
+        if (isTremoloLane(lane)) v = shiftDynamicMarkings(v, g_cfg.tremoloDynSteps);
+        R.ms_MuseSampler_add_track_dynamics_event_2(h, m.t, ms_DynamicsEvent_2 { e.t, v });
         break;
+    }
     case LogEntry::Pedal:
         R.ms_MuseSampler_add_track_pedal_event_2(h, m.t, ms_PedalEvent_2 { e.t, e.v });
         break;
@@ -776,7 +802,7 @@ static MirrorTrack* ensureMirror(Sampler& S, TrackInfo& ti, int shift)
     }
     MirrorTrack& m = ti.mirrors[shift];
     m.t = t;
-    for (const auto& e : ti.log) replayEntry(e, sh->h, m);
+    for (const auto& e : ti.log) replayEntry(e, sh->h, m, sh->lane);
     LOGD("mirror track for instrument %d at %+d, replayed %d events", ti.instId, shift, (int)ti.log.size());
     return &m;
 }
@@ -785,7 +811,7 @@ static void broadcast(Sampler& S, TrackInfo& ti, const LogEntry& e)
 {
     for (auto& mp : ti.mirrors) {
         auto sit = S.shadows.find(mp.first);
-        if (sit != S.shadows.end()) replayEntry(e, sit->second->h, mp.second);
+        if (sit != S.shadows.end()) replayEntry(e, sit->second->h, mp.second, sit->second->lane);
     }
     ti.log.push_back(e);
 }
@@ -1264,7 +1290,7 @@ static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes,
 {
     lanes.assign(q.items.size(), 0);
     gains.assign(q.items.size(), 1.0f);
-    if (!g_cfg.tremoloChords) return 0;
+    if (!g_cfg.tremoloChords && g_cfg.tremoloDynSteps == 0) return 0;
     const uint64_t TREM = (uint64_t)(ms_NoteArticulation_Tremolo1 | ms_NoteArticulation_Tremolo2
                                      | ms_NoteArticulation_Tremolo3 | ms_NoteArticulation_BuzzTremolo);
     int split = 0, chords = 0;
@@ -1279,7 +1305,13 @@ static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes,
             if (q.items[j].note.ev._location_us != loc) break;
             if ((uint64_t)q.items[j].note.ev._articulation & TREM) step.push_back(j);
         }
-        if (step.size() >= 2) {
+        if (step.size() >= 1 && (!g_cfg.tremoloChords || step.size() == 1)) {
+            // Only for tremolo_dynamic_steps: single tremolo notes (or whole tremolo chords when chords
+            // are not split) on lane 1, so their dynamic can be lowered without touching other notes.
+            // No gain change: nothing is added here.
+            if (g_cfg.tremoloDynSteps != 0)
+                for (size_t k : step) lanes[k] = SINGLE_TREMOLO_LANE;
+        } else if (step.size() >= 2) {
             std::stable_sort(step.begin(), step.end(), [&](size_t a, size_t b) {
                 return q.items[a].note.ev._pitch > q.items[b].note.ev._pitch;
             });
