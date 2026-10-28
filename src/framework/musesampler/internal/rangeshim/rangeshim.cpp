@@ -1057,6 +1057,7 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
 static void emitRangeTo(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voice, uint64_t art, const std::set<int>& targets)
 {
     static const std::set<int> mainOnly { 0 };
+    if (targets.size() == 1 && *targets.begin() == -1) return; // collapsed into an enclosing range
     for (int key : targets.empty() ? mainOnly : targets) {
         ms_MuseSampler h = S.s;
         ms_Track t = T;
@@ -1454,6 +1455,27 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
                 }
             }
         }
+        // A chord's notes each open and close the range (MuseSamplerSequencer::addNoteEvent), so a split
+        // chord tremolo gave every lane start,start ... end,end - and Muse Sounds then played the lane's
+        // repeated notes as separate attacks (a 'machine gun', Strudwick I:75 Vn I). Each extra instance
+        // gets one start before its first note and one end after its last; the normal instrument keeps
+        // MuseScore's markers as they are.
+        {
+            std::map<std::pair<int, uint64_t>, int> depth;
+            for (size_t i = 0; i < q.items.size(); ++i) {
+                const QItem& it = q.items[i];
+                if (it.isNote || it.drop) continue;
+                std::set<int> keep;
+                for (int key : tgt[i]) {
+                    if (key == 0) { keep.insert(key); continue; }
+                    int& d = depth[std::make_pair(key, it.art)];
+                    if (it.rangeStart) { if (d++ == 0) keep.insert(key); }
+                    else if (d > 0 && --d == 0) keep.insert(key);
+                }
+                if (keep.empty() && !tgt[i].empty()) tgt[i] = std::set<int> { -1 }; // nothing to send
+                else tgt[i] = keep;
+            }
+        }
         // Non-note items (articulation ranges) take the time of the next note in their voice.
         long long nextT = LLONG_MIN, lastT = 0;
         std::vector<long long> keys(q.items.size(), 0);
@@ -1476,7 +1498,7 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
             emitRangeTo(S, T, ti, it.rangeStart, it.voice, it.art, targets);
             if (debugOn(ti, o.t)) {
                 std::string who;
-                for (int k : targets) who += (who.empty() ? "" : ", ") + (k ? "lane " + std::to_string(keyLane(k)) + " shift " + std::to_string(keyShift(k)) : std::string("main"));
+                for (int k : targets) who += (who.empty() ? "" : ", ") + (k == -1 ? std::string("none (inside an open range)") : k ? "lane " + std::to_string(keyLane(k)) + " shift " + std::to_string(keyShift(k)) : std::string("main"));
                 LOGI("DEBUG   range %s %s voice %d (before the note at %.3fs) -> %s", it.rangeStart ? "START" : "END",
                      artNames(it.art, 0).c_str(), it.voice, o.t / 1e6, who.empty() ? "main (no notes inside)" : who.c_str());
             }
