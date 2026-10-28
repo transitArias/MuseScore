@@ -982,6 +982,7 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
     if (shift != 0 && (ev._articulation & ms_NoteArticulation_Trill) && ev._duration_us <= g_cfg.trillNoteUs) {
         ev._articulation = (ms_NoteArticulation)((uint64_t)ev._articulation & ~(uint64_t)ms_NoteArticulation_Trill);
     }
+    bool sentOk = true;
     if (R.ms_MuseSampler_add_track_note_event_6(dstS, dstT, ev, realId) != ms_Result_OK) {
         // The engine refused the note. Find out which property it objects to by retrying
         // variants (longer / without articulation marks), and log what it accepted.
@@ -1003,6 +1004,7 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
                 }
             }
         }
+        sentOk = accepted >= 0;
         static int reported = 0;
         bool detail = g_logLevel >= 2 || reported < 40 || debugOn(ti, ev._location_us);
         if (detail) {
@@ -1015,7 +1017,7 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
         }
     }
     {
-        bool ok = realId != 0;
+        bool ok = sentOk; // (an event id of 0 is valid: the first note on a new track)
         ti.sent.push_back(TrackInfo::SentNote { ev._location_us, ev._duration_us, n.ev._pitch, (uint64_t)ev._articulation,
                                                 (uint64_t)ev._articulation_2, ev._voice, key, ok });
     }
@@ -1038,15 +1040,24 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
     }
 }
 
-static void emitRange(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voice, uint64_t art)
+// Sends an articulation range marker only to the instances that play notes inside that range
+// (0 = the normal instrument). Before 2026-10-28 every marker went to every instance, and a new
+// instance replayed all earlier markers: hundreds of empty start/end pairs, after which Muse Sounds
+// mishandled the next tremolo (Strudwick I:13 basses crescendoed through a diminuendo).
+static void emitRangeTo(Sampler& S, ms_Track T, TrackInfo& ti, bool start, int voice, uint64_t art, const std::set<int>& targets)
 {
-    if (start) R.ms_MuseSampler_add_track_event_range_start(S.s, T, voice, (ms_NoteArticulation)art);
-    else R.ms_MuseSampler_add_track_event_range_end(S.s, T, voice, (ms_NoteArticulation)art);
-    LogEntry e;
-    e.kind = start ? LogEntry::RangeStart : LogEntry::RangeEnd;
-    e.voice = voice;
-    e.art = art;
-    broadcast(S, ti, e);
+    static const std::set<int> mainOnly { 0 };
+    for (int key : targets.empty() ? mainOnly : targets) {
+        ms_MuseSampler h = S.s;
+        ms_Track t = T;
+        if (key != 0) {
+            MirrorTrack* m = ensureMirror(S, ti, key);
+            auto sit = S.shadows.find(key);
+            if (m && sit != S.shadows.end()) { h = sit->second->h; t = m->t; }
+        }
+        if (start) R.ms_MuseSampler_add_track_event_range_start(h, t, voice, (ms_NoteArticulation)art);
+        else R.ms_MuseSampler_add_track_event_range_end(h, t, voice, (ms_NoteArticulation)art);
+    }
 }
 
 // Optional (trill_written_out): Muse Sounds gets only a "trill" mark, not the interval, and
@@ -1399,6 +1410,7 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     std::vector<Out> outs;
     std::map<VoiceQ*, std::vector<int> > plans;
     std::map<VoiceQ*, std::vector<float> > laneGains;
+    std::map<VoiceQ*, std::vector<std::set<int> > > rangeTargets;
     size_t seq = 0;
     int tremoloSplit = 0;
     for (auto& v : ti.voices) {
@@ -1410,6 +1422,28 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
         std::vector<float>& gains = laneGains[&q];
         tremoloSplit += assignTremoloLanes(ti, q, lanes, gains);
         for (size_t i = 0; i < shifts.size(); ++i) shifts[i] = laneKey(shifts[i], lanes[i]);
+        // Which instances play notes inside each range (start/end matched per articulation, nesting allowed).
+        std::vector<std::set<int> >& tgt = rangeTargets[&q];
+        tgt.assign(q.items.size(), std::set<int>());
+        {
+            std::map<uint64_t, std::vector<size_t> > open;
+            for (size_t i = 0; i < q.items.size(); ++i) {
+                const QItem& it = q.items[i];
+                if (it.isNote) {
+                    for (auto& op : open)
+                        for (size_t j : op.second) tgt[j].insert(shifts[i]);
+                } else if (!it.drop) {
+                    if (it.rangeStart) open[it.art].push_back(i);
+                    else {
+                        auto oit = open.find(it.art);
+                        if (oit != open.end() && !oit->second.empty()) {
+                            tgt[i] = tgt[oit->second.back()];
+                            oit->second.pop_back();
+                        }
+                    }
+                }
+            }
+        }
         // Non-note items (articulation ranges) take the time of the next note in their voice.
         long long nextT = LLONG_MIN, lastT = 0;
         std::vector<long long> keys(q.items.size(), 0);
@@ -1428,10 +1462,14 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
         QItem& it = o.q->items[o.idx];
         if (it.isNote) emitNote(S, T, ti, it.note, o.shift, laneGains[o.q][o.idx]);
         else if (!it.drop) {
-            emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
-            if (debugOn(ti, o.t))
-                LOGI("DEBUG   range %s %s voice %d (before the note at %.3fs; sent to main and all %d instance(s))", it.rangeStart ? "START" : "END",
-                     artNames(it.art, 0).c_str(), it.voice, o.t / 1e6, (int)ti.mirrors.size());
+            const std::set<int>& targets = rangeTargets[o.q][o.idx];
+            emitRangeTo(S, T, ti, it.rangeStart, it.voice, it.art, targets);
+            if (debugOn(ti, o.t)) {
+                std::string who;
+                for (int k : targets) who += (who.empty() ? "" : ", ") + (k ? "lane " + std::to_string(keyLane(k)) + " shift " + std::to_string(keyShift(k)) : std::string("main"));
+                LOGI("DEBUG   range %s %s voice %d (before the note at %.3fs) -> %s", it.rangeStart ? "START" : "END",
+                     artNames(it.art, 0).c_str(), it.voice, o.t / 1e6, who.empty() ? "main (no notes inside)" : who.c_str());
+            }
         }
     }
     if (tremoloSplit)
@@ -1994,23 +2032,19 @@ static ms_Result rangeEvent(ms_MuseSampler ms, ms_Track t, int voice, ms_NoteArt
     TrackInfo* ti = trackInfo(*S, t);
     if (!ti) return direct();
     try {
-        auto vit = ti->voices.find(voice);
-        if (vit != ti->voices.end() && vit->second.hasNotes) {
+        // Tracks whose notes are queued (instruments with range data): queue the marker with the
+        // voice's notes, also before the voice's first note, so flushTrack can send it only to the
+        // instances that play inside the range. Pass-through tracks: straight to the engine.
+        if (rangeFor(*ti)) {
             QItem item;
             item.isNote = false;
             item.rangeStart = start;
             item.voice = voice;
             item.art = (uint64_t)art;
-            vit->second.items.push_back(std::move(item));
+            ti->voices[voice].items.push_back(std::move(item));
             return ms_Result_OK;
         }
-        ms_Result r = direct();
-        LogEntry e;
-        e.kind = start ? LogEntry::RangeStart : LogEntry::RangeEnd;
-        e.voice = voice;
-        e.art = (uint64_t)art;
-        broadcast(*S, *ti, e);
-        return r;
+        return direct();
     } catch (...) {
         LOGE("exception in range event");
         return ms_Result_Error;
