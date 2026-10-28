@@ -40,7 +40,7 @@ private:
     static int stepDurationTicks(const Chord* chord, int tremoloLines);
     static void buildAndAppendEvents(const Chord* chord, const muse::mpe::ArticulationType type, const int stepDurationTicks,
                                      const int startTick, const RenderingContext& ctx, TremoloTimeCache& tremoloCache,
-                                     muse::mpe::PlaybackEventList& result);
+                                     muse::mpe::PlaybackEventList& result, bool firstStep = true, bool lastStep = true);
     static const muse::mpe::TimestampAndDuration& tremoloTimeAndDuration(const Note* note, const RenderingContext& ctx,
                                                                          TremoloTimeCache& cache);
 };

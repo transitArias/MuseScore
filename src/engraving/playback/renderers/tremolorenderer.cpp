@@ -124,6 +124,33 @@ static duration_t tremoloDuration(const Note* note, const timestamp_t tremoloTim
     return ctx.nominalDuration;
 }
 
+// Articulations that happen once per written note, not once per repeated tremolo note: attacks
+// and bowings (start of the tremolo), and release gestures (end of the tremolo). Techniques that
+// last the whole note (mute, sul pont., harmonics, pizz., vibrato, noteheads...) stay on every step.
+static const ArticulationTypeSet& tremoloOnsetOnlyTypes()
+{
+    static const ArticulationTypeSet types = {
+        ArticulationType::Staccato, ArticulationType::Staccatissimo, ArticulationType::Tenuto,
+        ArticulationType::Marcato, ArticulationType::Accent, ArticulationType::SoftAccent,
+        ArticulationType::Subito, ArticulationType::FadeIn,
+        ArticulationType::UpBow, ArticulationType::DownBow, ArticulationType::Detache,
+        ArticulationType::Martele, ArticulationType::Jete, ArticulationType::SnapPizzicato,
+        ArticulationType::Scoop, ArticulationType::Plop, ArticulationType::BrassBend,
+        ArticulationType::SlideInAbove, ArticulationType::SlideInBelow,
+    };
+    return types;
+}
+
+static const ArticulationTypeSet& tremoloReleaseOnlyTypes()
+{
+    static const ArticulationTypeSet types = {
+        ArticulationType::FadeOut, ArticulationType::LaissezVibrer,
+        ArticulationType::Fall, ArticulationType::QuickFall, ArticulationType::Doit,
+        ArticulationType::SlideOutDown, ArticulationType::SlideOutUp,
+    };
+    return types;
+}
+
 const ArticulationTypeSet& TremoloRenderer::supportedTypes()
 {
     static const mpe::ArticulationTypeSet types = {
@@ -206,8 +233,11 @@ void TremoloRenderer::doRender(const EngravingItem* item, const mpe::Articulatio
                 currentChord = secondTremoloChord;
             }
 
+            // Each chord's first appearance starts it, its last appearance ends it.
+            const bool firstOfChord = i < 2;
+            const bool lastOfChord = i >= stepsCount - 2;
             buildAndAppendEvents(currentChord, preferredType, stepDurationTicks, ctx.nominalPositionStartTick + i * stepDurationTicks,
-                                 ctx, tremoloTimeCache, result);
+                                 ctx, tremoloTimeCache, result, firstOfChord, lastOfChord);
         }
 
         return;
@@ -215,7 +245,7 @@ void TremoloRenderer::doRender(const EngravingItem* item, const mpe::Articulatio
 
     for (int i = 0; i < stepsCount; ++i) {
         buildAndAppendEvents(chord, preferredType, stepDurationTicks, ctx.nominalPositionStartTick + i * stepDurationTicks,
-                             ctx, tremoloTimeCache, result);
+                             ctx, tremoloTimeCache, result, i == 0, i == stepsCount - 1);
     }
 }
 
@@ -232,7 +262,8 @@ void TremoloRenderer::buildAndAppendEvents(const Chord* chord, const Articulatio
                                            const int stepDurationTicks,
                                            const int startTick, const RenderingContext& ctx,
                                            TremoloTimeCache& tremoloCache,
-                                           mpe::PlaybackEventList& result)
+                                           mpe::PlaybackEventList& result,
+                                           bool firstStep, bool lastStep)
 {
     for (const Note* note : chord->notes()) {
         if (!NoteRenderer::shouldRender(note, ctx, ctx.commonArticulations)) {
@@ -250,6 +281,19 @@ void TremoloRenderer::buildAndAppendEvents(const Chord* chord, const Articulatio
         noteCtx.dynamicLevel = ctx.playbackCtx->appliableDynamicLevel(note->track(), utick);
 
         NoteArticulationsParser::buildNoteArticulationMap(note, ctx, noteCtx.articulations);
+
+        // An accent (staccato, bowing, ...) on a tremolo note belongs to its attack only, and a
+        // fall / let-ring to its end: don't repeat them on every repeated note.
+        if (!firstStep) {
+            for (ArticulationType t : tremoloOnsetOnlyTypes()) {
+                noteCtx.articulations.erase(t);
+            }
+        }
+        if (!lastStep) {
+            for (ArticulationType t : tremoloReleaseOnlyTypes()) {
+                noteCtx.articulations.erase(t);
+            }
+        }
 
         const TimestampAndDuration& tremoloTnD = tremoloTimeAndDuration(note, ctx, tremoloCache);
         muse::mpe::ArticulationAppliedData& articulationData = noteCtx.articulations.at(type);
