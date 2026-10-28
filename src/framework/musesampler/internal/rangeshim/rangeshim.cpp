@@ -177,7 +177,8 @@ struct Config {
     int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
     bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
     float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
-    bool tremoloMerge = true;      // tremolo instances get one long note per tremolo, not its 32nd repetitions
+    bool tremoloMerge = false;     // tremolo instances get one long note per tremolo (makes Muse Sounds trill a half step: off)
+    bool tremoloNoSulPont = true;  // tremolo notes drop the sul ponticello mark (Muse Strings has no sul pont. tremolo: it ratchets)
     bool refinalize = true;        // re-finalize an instance's other tracks after a track is added to it
     int tremoloDynSteps = -1;      // tremolo notes get the score's dynamic this many markings softer (0 = off)
     // Diagnostics: for instruments whose "pack|name" contains debugInst, log what every instance was sent
@@ -242,7 +243,8 @@ static void loadConfigAndRanges()
     g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
     g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
-    g_cfg.tremoloMerge = cfg.geti("general", "tremolo_merge", 1) != 0;
+    g_cfg.tremoloMerge = cfg.geti("general", "tremolo_merge", 0) != 0;
+    g_cfg.tremoloNoSulPont = cfg.geti("general", "tremolo_ignore_sul_pont", 1) != 0;
     g_cfg.refinalize = cfg.geti("general", "refinalize_instances", 1) != 0;
     g_cfg.tremoloDynSteps = (int)std::max<long long>(-4, std::min<long long>(2, cfg.geti("general", "tremolo_dynamic_steps", -1)));
     g_cfg.debugInst = lower(cfg.get("general", "debug_instrument", ""));
@@ -282,7 +284,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d refinalize_instances=%d tremolo_merge=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps, (int)g_cfg.refinalize, (int)g_cfg.tremoloMerge);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f dynamic_steps=%d refinalize_instances=%d tremolo_merge=%d tremolo_ignore_sul_pont=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain, g_cfg.tremoloDynSteps, (int)g_cfg.refinalize, (int)g_cfg.tremoloMerge, (int)g_cfg.tremoloNoSulPont);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -987,6 +989,13 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
     const int shift = keyShift(key);
     ms_NoteEvent_5 ev = n.ev;
     ev._pitch -= shift;
+    // Muse Strings has no sul ponticello tremolo recording: a sul pont. tremolo note is played as its
+    // written-out repetitions, a ratchet (tremolo test bench 2026-10-28). Play the normal tremolo instead.
+    if (g_cfg.tremoloNoSulPont
+        && ((uint64_t)ev._articulation & (uint64_t)(ms_NoteArticulation_Tremolo1 | ms_NoteArticulation_Tremolo2
+                                                    | ms_NoteArticulation_Tremolo3 | ms_NoteArticulation_BuzzTremolo))) {
+        ev._articulation = (ms_NoteArticulation)((uint64_t)ev._articulation & ~(uint64_t)ms_NoteArticulation_SulPonticello);
+    }
     if (ev._articulation & ms_NoteArticulation_Trill) {
         int tc = trillCentsFor(ti);
         if (tc) ev._offset_cents = std::max(-100, std::min(100, ev._offset_cents + tc));
