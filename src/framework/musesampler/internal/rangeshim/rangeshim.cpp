@@ -558,6 +558,12 @@ struct Sampler {
     std::map<std::pair<ms_Track, int>, int> audition; // (track, pitch) -> shift
     float muteGainNow = 1.0f; // current (ramped) con sord. gain on this sampler's output
     long long lastBadDetailUs = LLONG_MIN; // bad-audio report: last time a detailed report was written
+    // debug_instrument audio levels: 100 ms windows of the main output and of every extra instance.
+    int dbgLevel = -1; // -1 unknown, 0 no, 1 yes
+    long long dbgWin = LLONG_MIN;
+    double dbgMain = 0;
+    std::map<int, double> dbgSh;
+    long long dbgN = 0;
 };
 
 static CritSec g_mapCs;
@@ -1860,6 +1866,7 @@ EXPORT ms_Track ms_MuseSampler_add_track(ms_MuseSampler ms, int instrumentId)
         Guard g(S->cs);
         TrackInfo& ti = S->tracks[t];
         ti.instId = instrumentId;
+        S->dbgLevel = -1;
     }
     return t;
 }
@@ -2443,6 +2450,54 @@ static void sanitize(Sampler& S, ms_OutputBuffer& buf, const char* stage, double
     }
 }
 
+// ---- debug_instrument: measured audio levels (what was actually heard), 100 ms windows ----
+static bool samplerDebug(Sampler& S)
+{
+    if (S.dbgLevel < 0) {
+        S.dbgLevel = 0;
+        if (!g_cfg.debugInst.empty() && g_cfg.debugToUs > g_cfg.debugFromUs)
+            for (auto& tp : S.tracks)
+                if (lower(instName(tp.second.instId)).find(g_cfg.debugInst) != std::string::npos) S.dbgLevel = 1;
+    }
+    return S.dbgLevel == 1;
+}
+
+static double sumSq(float* const* ch, int nch, int n)
+{
+    double s = 0;
+    for (int c = 0; c < nch; ++c) {
+        if (!ch[c]) continue;
+        for (int i = 0; i < n; ++i) s += (double)ch[c][i] * ch[c][i];
+    }
+    return s;
+}
+
+static void dbgLevelBlock(Sampler& S, long long tUs, int n, double mainSq, const std::map<int, double>& shSq, const char* mode)
+{
+    static std::atomic<int> lines { 0 };
+    const long long win = tUs / 100000;
+    if (win != S.dbgWin) {
+        const long long w0 = S.dbgWin * 100000;
+        if (S.dbgWin != LLONG_MIN && S.dbgN > 0 && w0 >= g_cfg.debugFromUs && w0 <= g_cfg.debugToUs && lines.fetch_add(1) < 3000) {
+            auto db = [&](double sq) { double r = std::sqrt(sq / (2.0 * S.dbgN)); return r > 1e-7 ? 20.0 * std::log10(r) : -140.0; };
+            std::string sh;
+            for (auto& p : S.dbgSh) {
+                char b[64];
+                snprintf(b, sizeof(b), " | lane %d shift %+d: %6.1f dB", keyLane(p.first), keyShift(p.first), db(p.second));
+                sh += b;
+            }
+            LOGI("DEBUG level %s %.1fs: engine (main) %6.1f dB%s", mode, w0 / 1e6, db(S.dbgMain), sh.c_str());
+        }
+        S.dbgWin = win;
+        S.dbgMain = 0;
+        S.dbgSh.clear();
+        S.dbgN = 0;
+    }
+    S.dbgMain += mainSq;
+    for (auto& p : shSq) S.dbgSh[p.first] += p.second;
+    S.dbgN += n;
+}
+
 EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuffer buf)
 {
     ensureReal();
@@ -2453,15 +2508,24 @@ EXPORT ms_Result ms_MuseSampler_process_offline(ms_MuseSampler ms, ms_OutputBuff
     Guard g(S->cs);
     const double offSec = S->offPos / (S->offSr > 0 ? S->offSr : 44100.0);
     sanitize(*S, buf, "engine", offSec);
+    const bool dbg = samplerDebug(*S);
+    const double mainSq = dbg ? sumSq(buf._channels, std::min(buf._num_channels, 2), buf._num_data_pts) : 0;
+    std::map<int, double> shSq;
     try {
         for (auto& sp : S->shadows) {
-            if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowOffline(*S, *sp.second, buf);
+            bool w = shadowWanted(*S, *sp.second, buf._num_data_pts);
+            if (w) mixShadowOffline(*S, *sp.second, buf);
+            if (dbg && sp.second->notes > 0) {
+                float* ch[2] = { sp.second->in[0].data(), sp.second->in[1].data() };
+                shSq[sp.first] = w ? sumSq(ch, 2, buf._num_data_pts) : 0;
+            }
         }
     } catch (...) {
         LOGE("exception in offline shadow render");
     }
     applyMuteGain(*S, buf, (long long)(offSec * 1e6));
     if (!S->shadows.empty()) sanitize(*S, buf, "shift", offSec);
+    if (dbg) dbgLevelBlock(*S, (long long)(offSec * 1e6), buf._num_data_pts, mainSq, shSq, "export");
     S->offPos += buf._num_data_pts;
     return r;
 }
@@ -2477,15 +2541,24 @@ EXPORT ms_Result ms_MuseSampler_process(ms_MuseSampler ms, ms_OutputBuffer buf, 
     S->pos = samples;
     const double liveSec = samples / (S->sr > 0 ? S->sr : 48000.0);
     sanitize(*S, buf, "engine", liveSec);
+    const bool dbg = S->playing && samplerDebug(*S);
+    const double mainSq = dbg ? sumSq(buf._channels, std::min(buf._num_channels, 2), buf._num_data_pts) : 0;
+    std::map<int, double> shSq;
     try {
         for (auto& sp : S->shadows) {
-            if (shadowWanted(*S, *sp.second, buf._num_data_pts)) mixShadowLive(*S, *sp.second, buf, samples);
+            bool w = shadowWanted(*S, *sp.second, buf._num_data_pts);
+            if (w) mixShadowLive(*S, *sp.second, buf, samples);
+            if (dbg && sp.second->notes > 0) {
+                float* ch[2] = { sp.second->in[0].data(), sp.second->in[1].data() };
+                shSq[sp.first] = w ? sumSq(ch, 2, buf._num_data_pts) : 0;
+            }
         }
     } catch (...) {
         LOGE("exception in shadow render");
     }
     applyMuteGain(*S, buf, (long long)(liveSec * 1e6));
     if (!S->shadows.empty()) sanitize(*S, buf, "shift", liveSec);
+    if (dbg) dbgLevelBlock(*S, (long long)(liveSec * 1e6), buf._num_data_pts, mainSq, shSq, "live");
     return r;
 }
 
