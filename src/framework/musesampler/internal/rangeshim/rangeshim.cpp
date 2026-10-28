@@ -733,6 +733,15 @@ static Shadow* ensureShadow(Sampler& S, int key)
     return raw;
 }
 
+static std::string instName(int instId);
+static std::string artNames(uint64_t a1, uint64_t a2);
+static bool debugOn(const TrackInfo& ti, long long tUs)
+{
+    if (g_cfg.debugInst.empty() || g_cfg.debugToUs <= g_cfg.debugFromUs) return false;
+    if (tUs < g_cfg.debugFromUs || tUs > g_cfg.debugToUs) return false;
+    return lower(instName(ti.instId)).find(g_cfg.debugInst) != std::string::npos;
+}
+
 // Lanes 1..49 play only tremolo notes (see assignTremoloLanes): 1.. = chord ranks, 40 = unsplit tremolos.
 static inline bool isTremoloLane(int lane) { return lane >= 1 && lane < 50; }
 static const int SINGLE_TREMOLO_LANE = 40; // unsplit tremolos (own gain 1), never shares a lane with chord ranks
@@ -995,7 +1004,7 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key,
             }
         }
         static int reported = 0;
-        bool detail = g_logLevel >= 2 || reported < 40;
+        bool detail = g_logLevel >= 2 || reported < 40 || debugOn(ti, ev._location_us);
         if (detail) {
             ++reported;
             LOGI("engine rejected note %s @%.3fs dur %lldms art 0x%llx/0x%llx voice %d track %p shift %+d lane %d -> %s",
@@ -1345,8 +1354,6 @@ static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes,
     return split;
 }
 
-static std::string instName(int instId);
-static std::string artNames(uint64_t a1, uint64_t a2);
 
 // debug_instrument / debug_from_s / debug_to_s: what each instance of this track was sent in the window.
 static void debugReport(Sampler& S, ms_Track T, TrackInfo& ti)
@@ -1420,7 +1427,12 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     for (auto& o : outs) {
         QItem& it = o.q->items[o.idx];
         if (it.isNote) emitNote(S, T, ti, it.note, o.shift, laneGains[o.q][o.idx]);
-        else if (!it.drop) emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
+        else if (!it.drop) {
+            emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
+            if (debugOn(ti, o.t))
+                LOGI("DEBUG   range %s %s voice %d (before the note at %.3fs; sent to main and all %d instance(s))", it.rangeStart ? "START" : "END",
+                     artNames(it.art, 0).c_str(), it.voice, o.t / 1e6, (int)ti.mirrors.size());
+        }
     }
     if (tremoloSplit)
         LOGI("instrument %d: %d tremolo chord note(s) played on their own instance (one-note tremolo per chord note, balanced %d)",
