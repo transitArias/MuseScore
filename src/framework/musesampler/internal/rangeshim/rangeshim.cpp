@@ -174,6 +174,8 @@ struct Config {
     long long trillGapUs = 30000;  // gap between two back-to-back trills on different notes
     bool tremoloChords = true;     // chord tremolos: each chord note on its own engine instance
     int tremoloMaxLanes = 6;       // most notes of one tremolo chord that get their own instance
+    bool tremoloBalance = true;    // each chord note at 1/sqrt(N) so the chord sums to one section's level
+    float tremoloGain = 1.0f;      // extra gain on chord-tremolo notes (tremolo_chord_gain_db)
 };
 
 static Config g_cfg;
@@ -230,6 +232,8 @@ static void loadConfigAndRanges()
     g_cfg.trillGapUs = 1000 * std::max<long long>(0, std::min<long long>(200, cfg.geti("general", "trill_gap_ms", 30)));
     g_cfg.tremoloChords = cfg.geti("general", "tremolo_chords", 1) != 0;
     g_cfg.tremoloMaxLanes = (int)std::max<long long>(2, std::min<long long>(12, cfg.geti("general", "tremolo_max_notes", 6)));
+    g_cfg.tremoloBalance = cfg.geti("general", "tremolo_chord_balance", 1) != 0;
+    g_cfg.tremoloGain = (float)std::pow(10.0, std::max(-40.0, std::min(12.0, cfg.getd("general", "tremolo_chord_gain_db", 0.0))) / 20.0);
 
     Ini rng;
     if (!rng.load(g_dir + L"\\ranges.ini")) {
@@ -256,7 +260,7 @@ static void loadConfigAndRanges()
     for (const auto& p : g_rangesByKey) {
         if (p.second.id >= 0) g_rangesById[p.second.id] = p.second;
     }
-    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords);
+    LOGI("config: staccato_scale=%.2f legato_max_leap=%d (solo only %d) trill_written_out=%d trill_priority=%d trill_gap_ms=%lld tremolo_chords=%d balance=%d gain=%.2f", g_cfg.staccatoScale, g_cfg.legatoMaxLeap, (int)g_cfg.legatoMaxLeapSoloOnly, g_cfg.trillWrittenOut, (int)g_cfg.trillPriority, g_cfg.trillGapUs / 1000, (int)g_cfg.tremoloChords, (int)g_cfg.tremoloBalance, g_cfg.tremoloGain);
     LOGI("config: enabled=%d mode=%s max_up=%d extend_down=%d legato_phrases=%d block_ms=%.0f formant=%d; %d instruments in ranges.ini (probed with lib %s)",
          (int)g_cfg.enabled, g_cfg.octaveMode ? "octave" : "nearest", g_cfg.maxShiftUp, (int)g_cfg.extendDown,
          (int)g_cfg.legatoPhrases, g_cfg.shifterBlockMs, (int)g_cfg.formant, (int)g_rangesByKey.size(),
@@ -487,6 +491,10 @@ struct Shadow {
     int shift = 0; // semitones of transposition (pitch shifter); 0 = played as is
     int lane = 0;
     int key = 0;
+    // Tremolo-chord lanes: output gain over time (start, end incl. release, gain), sorted by start.
+    struct GainSpan { long long start, end; float gain; bool operator<(const GainSpan& o) const { return start < o.start; } };
+    std::vector<GainSpan> gainSpans;
+    float laneGainNow = 1.0f;
     ms_MuseSampler h = nullptr;
     std::unique_ptr<Stretch> fx;
     int latency = 0;
@@ -869,7 +877,7 @@ static int shiftFor(int pitch, int top, int low, bool trill = false)
     return 0;
 }
 
-static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key)
+static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key, float laneGain = 1.0f)
 {
     long long realId = 0;
     ms_MuseSampler dstS = S.s;
@@ -883,6 +891,10 @@ static void emitNote(Sampler& S, ms_Track T, TrackInfo& ti, NoteRec& n, int key)
             m->notes++;
             sh->notes++;
             sh->idleSamples = 0;
+            if (sh->lane > 0) {
+                Shadow::GainSpan gs { n.ev._location_us, n.ev._location_us + n.ev._duration_us + 400000, laneGain };
+                sh->gainSpans.insert(std::upper_bound(sh->gainSpans.begin(), sh->gainSpans.end(), gs), gs);
+            }
         } else {
             key = 0;
         }
@@ -1217,9 +1229,10 @@ static void planVoice(TrackInfo& ti, VoiceQ& q, std::vector<int>& shifts)
 // in the chord, top note first (lane 0 = the normal instrument): every lane then sees a
 // single repeated note (one-note tremolo), or, for a two-chord tremolo between chords, one
 // note of each chord alternating (two-note tremolo, as written).
-static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes)
+static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes, std::vector<float>& gains)
 {
     lanes.assign(q.items.size(), 0);
+    gains.assign(q.items.size(), 1.0f);
     if (!g_cfg.tremoloChords) return 0;
     const uint64_t TREM = (uint64_t)(ms_NoteArticulation_Tremolo1 | ms_NoteArticulation_Tremolo2
                                      | ms_NoteArticulation_Tremolo3 | ms_NoteArticulation_BuzzTremolo);
@@ -1244,14 +1257,19 @@ static int assignTremoloLanes(TrackInfo& ti, VoiceQ& q, std::vector<int>& lanes)
                 int p = q.items[k].note.ev._pitch;
                 if (lastPitch != INT_MIN && p != lastPitch) ++rank; // unison doublings share a lane
                 lastPitch = p;
-                lanes[k] = std::min(rank, g_cfg.tremoloMaxLanes - 1);
-                if (lanes[k] > 0) ++split;
+                // Every chord note on its own instance (lanes 1..), the normal instrument rests, so
+                // the instances can be balanced: N full sections would be N times too loud.
+                lanes[k] = 1 + std::min(rank, g_cfg.tremoloMaxLanes - 1);
+                ++split;
             }
+            const int nNotes = std::min(rank + 1, g_cfg.tremoloMaxLanes);
+            const float g = (g_cfg.tremoloBalance ? 1.0f / std::sqrt((float)nNotes) : 1.0f) * g_cfg.tremoloGain;
+            for (size_t k : step) gains[k] = g;
             ++chords;
         }
         i = j;
     }
-    if (chords) LOGD("instrument %d: %d tremolo chord step(s), %d note(s) on extra instances", ti.instId, chords, split);
+    if (chords) LOGD("instrument %d: %d tremolo chord step(s), %d note(s) on chord instances", ti.instId, chords, split);
     return split;
 }
 
@@ -1269,6 +1287,7 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     };
     std::vector<Out> outs;
     std::map<VoiceQ*, std::vector<int> > plans;
+    std::map<VoiceQ*, std::vector<float> > laneGains;
     size_t seq = 0;
     int tremoloSplit = 0;
     for (auto& v : ti.voices) {
@@ -1277,7 +1296,8 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
         std::vector<int>& shifts = plans[&q];
         planVoice(ti, q, shifts);
         std::vector<int> lanes;
-        tremoloSplit += assignTremoloLanes(ti, q, lanes);
+        std::vector<float>& gains = laneGains[&q];
+        tremoloSplit += assignTremoloLanes(ti, q, lanes, gains);
         for (size_t i = 0; i < shifts.size(); ++i) shifts[i] = laneKey(shifts[i], lanes[i]);
         // Non-note items (articulation ranges) take the time of the next note in their voice.
         long long nextT = LLONG_MIN, lastT = 0;
@@ -1295,12 +1315,12 @@ static void flushTrack(Sampler& S, ms_Track T, TrackInfo& ti)
     std::stable_sort(outs.begin(), outs.end(), [](const Out& a, const Out& b) { return a.t < b.t; });
     for (auto& o : outs) {
         QItem& it = o.q->items[o.idx];
-        if (it.isNote) emitNote(S, T, ti, it.note, o.shift);
+        if (it.isNote) emitNote(S, T, ti, it.note, o.shift, laneGains[o.q][o.idx]);
         else if (!it.drop) emitRange(S, T, ti, it.rangeStart, it.voice, it.art);
     }
     if (tremoloSplit)
-        LOGI("instrument %d: %d tremolo chord note(s) played on their own instance (one-note tremolo per chord note)",
-             ti.instId, tremoloSplit);
+        LOGI("instrument %d: %d tremolo chord note(s) played on their own instance (one-note tremolo per chord note, balanced %d)",
+             ti.instId, tremoloSplit, (int)g_cfg.tremoloBalance);
     for (auto& v : ti.voices) {
         VoiceQ& q = v.second;
         q.items.clear();
@@ -1339,6 +1359,31 @@ static void teleReport(Sampler& S, Shadow& sh, long long pos)
     sh.teleN = 0;
 }
 
+// Lane output gain at tUs: the latest-started chord-tremolo note still sounding decides.
+static float laneGainAt(const Shadow& sh, long long tUs)
+{
+    if (sh.lane == 0 || sh.gainSpans.empty()) return 1.0f;
+    Shadow::GainSpan key { tUs, 0, 0 };
+    auto it = std::upper_bound(sh.gainSpans.begin(), sh.gainSpans.end(), key); // first span starting after tUs
+    while (it != sh.gainSpans.begin()) {
+        --it;
+        if (it->end >= tUs) return it->gain;           // latest-started note still sounding
+        if (tUs - it->start > 30000000) break;         // nothing that old is still sounding
+    }
+    return sh.laneGainNow;                             // between notes: keep the last value
+}
+
+// Multiplies sh.in (n frames) by the lane gain, ramped from the previous block's value.
+static void applyLaneGain(Shadow& sh, int n, long long tUs)
+{
+    if (sh.lane == 0) return;
+    float target = laneGainAt(sh, tUs), g0 = sh.laneGainNow;
+    if (g0 == 1.0f && target == 1.0f) return;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < n; ++i) sh.in[c][i] *= g0 + (target - g0) * (float)(i + 1) / (float)n;
+    sh.laneGainNow = target;
+}
+
 // Unshifted instance (tremolo-chord lane): render in step with the main sampler and add.
 static void addDirect(Shadow& sh, int n, ms_OutputBuffer& dst)
 {
@@ -1366,6 +1411,7 @@ static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long lon
         }
         if (S.playing) sh.needsPrime = false;
         renderShadow(sh, n, false, pos, S.playing);
+        applyLaneGain(sh, n, (long long)(pos / (S.sr > 0 ? S.sr : 48000.0) * 1e6));
         addDirect(sh, n, out);
         sh.expectedPos = S.playing ? pos + n : pos;
         return;
@@ -1386,6 +1432,7 @@ static void mixShadowLive(Sampler& S, Shadow& sh, ms_OutputBuffer& out, long lon
         }
     }
     renderShadow(sh, n, false, pos + sh.la, S.playing);
+    applyLaneGain(sh, n, (long long)((pos + sh.la) / (S.sr > 0 ? S.sr : 48000.0) * 1e6));
     runFx(sh, n, &out);
     if (sh.notes > 0) teleReport(S, sh, pos);
     sh.expectedPos = S.playing ? pos + n : pos;
@@ -1403,6 +1450,7 @@ static void mixShadowOffline(Sampler& S, Shadow& sh, ms_OutputBuffer& out)
             sh.needsPrime = false;
         }
         renderShadow(sh, n, true, 0);
+        applyLaneGain(sh, n, (long long)(S.offPos / (S.offSr > 0 ? S.offSr : 44100.0) * 1e6));
         addDirect(sh, n, out);
         return;
     }
@@ -1417,6 +1465,7 @@ static void mixShadowOffline(Sampler& S, Shadow& sh, ms_OutputBuffer& out)
         sh.needsPrime = false;
     }
     renderShadow(sh, n, true, 0);
+    applyLaneGain(sh, n, (long long)((S.offPos + sh.la) / (S.offSr > 0 ? S.offSr : 44100.0) * 1e6));
     runFx(sh, n, &out);
     if (sh.notes > 0) teleReport(S, sh, S.offPos);
 }
@@ -1671,6 +1720,7 @@ EXPORT ms_Result ms_MuseSampler_clear_track(ms_MuseSampler ms, ms_Track t)
     ti->muteSpans.clear();
     ti->muteNotes.clear();
     ti->sent.clear();
+    for (auto& sp : S->shadows) if (sp.second->lane > 0) sp.second->gainSpans.clear();
     for (auto& mp : ti->mirrors) {
         auto sit = S->shadows.find(mp.first);
         if (sit == S->shadows.end()) continue;
